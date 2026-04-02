@@ -11,13 +11,10 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
-import time
 import uuid
 from typing import Optional
 
 from tools.environments.base import BaseEnvironment
-from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
 
@@ -373,6 +370,9 @@ class DockerEnvironment(BaseEnvironment):
         self._container_id = result.stdout.strip()
         logger.info(f"Started container {container_name} ({self._container_id[:12]})")
 
+        # Capture login-shell environment into a snapshot for the unified model
+        self.init_session()
+
     @staticmethod
     def _storage_opt_supported() -> bool:
         """Check if Docker's storage driver supports --storage-opt size=.
@@ -413,101 +413,86 @@ class DockerEnvironment(BaseEnvironment):
         logger.debug("Docker --storage-opt support: %s", _storage_opt_ok)
         return _storage_opt_ok
 
-    def execute(self, command: str, cwd: str = "", *,
-                timeout: int | None = None,
-                stdin_data: str | None = None) -> dict:
-        exec_command, sudo_stdin = self._prepare_command(command)
-        work_dir = cwd or self.cwd
-        effective_timeout = timeout or self.timeout
+    # ------------------------------------------------------------------
+    # Unified execution primitives
+    # ------------------------------------------------------------------
 
-        # Merge sudo password (if any) with caller-supplied stdin_data.
-        if sudo_stdin is not None and stdin_data is not None:
-            effective_stdin = sudo_stdin + stdin_data
-        elif sudo_stdin is not None:
-            effective_stdin = sudo_stdin
-        else:
-            effective_stdin = stdin_data
+    def _build_forward_env_args(self) -> list[str]:
+        """Build ``-e KEY=VALUE`` arguments for docker exec env forwarding.
 
-        # docker exec -w doesn't expand ~, so prepend a cd into the command
-        if work_dir == "~" or work_dir.startswith("~/"):
-            exec_command = f"cd {work_dir} && {exec_command}"
-            work_dir = "/"
-
-        assert self._container_id, "Container not started"
-        cmd = [self._docker_exe, "exec"]
-        if effective_stdin is not None:
-            cmd.append("-i")
-        cmd.extend(["-w", work_dir])
-        # Combine explicit docker_forward_env with skill-declared env_passthrough
-        # vars so skills that declare required_environment_variables (e.g. Notion)
-        # have their keys forwarded into the container automatically.
+        Combines explicit ``docker_forward_env`` with skill-declared
+        ``env_passthrough`` vars so skills that declare
+        ``required_environment_variables`` (e.g. Notion) have their keys
+        forwarded into the container automatically.
+        """
         forward_keys = set(self._forward_env)
         try:
             from tools.env_passthrough import get_all_passthrough
             forward_keys |= get_all_passthrough()
         except Exception:
             pass
+
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
+        args: list[str] = []
         for key in sorted(forward_keys):
             value = os.getenv(key)
             if value is None:
                 value = hermes_env.get(key)
             if value is not None:
-                cmd.extend(["-e", f"{key}={value}"])
-        cmd.extend([self._container_id, "bash", "-lc", exec_command])
+                args.extend(["-e", f"{key}={value}"])
+        return args
 
-        try:
-            _output_chunks = []
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                stdin=subprocess.PIPE if effective_stdin else subprocess.DEVNULL,
-                text=True,
-            )
-            if effective_stdin:
-                try:
-                    proc.stdin.write(effective_stdin)
-                    proc.stdin.close()
-                except Exception:
-                    pass
+    def _run_bash(self, cmd_string: str, *,
+                  stdin_data: str | None = None) -> subprocess.Popen:
+        """Spawn ``bash -c <cmd_string>`` inside the Docker container."""
+        assert self._container_id, "Container not started"
+        cmd = [self._docker_exe, "exec"]
+        if stdin_data is not None:
+            cmd.append("-i")
+        cmd.extend(self._build_forward_env_args())
+        cmd.extend([self._container_id, "bash", "-c", cmd_string])
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            text=True,
+        )
+        if stdin_data:
+            try:
+                proc.stdin.write(stdin_data)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+        return proc
 
-            def _drain():
-                try:
-                    for line in proc.stdout:
-                        _output_chunks.append(line)
-                except Exception:
-                    pass
-
-            reader = threading.Thread(target=_drain, daemon=True)
-            reader.start()
-            deadline = time.monotonic() + effective_timeout
-
-            while proc.poll() is None:
-                if is_interrupted():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    reader.join(timeout=2)
-                    return {
-                        "output": "".join(_output_chunks) + "\n[Command interrupted]",
-                        "returncode": 130,
-                    }
-                if time.monotonic() > deadline:
-                    proc.kill()
-                    reader.join(timeout=2)
-                    return self._timeout_result(effective_timeout)
-                time.sleep(0.2)
-
-            reader.join(timeout=5)
-            return {"output": "".join(_output_chunks), "returncode": proc.returncode}
-        except Exception as e:
-            return {"output": f"Docker execution error: {e}", "returncode": 1}
+    def _run_bash_login(self, cmd_string: str) -> subprocess.Popen:
+        """Spawn ``bash -l -c <cmd_string>`` for snapshot creation."""
+        assert self._container_id, "Container not started"
+        cmd = [self._docker_exe, "exec", self._container_id,
+               "bash", "-l", "-c", cmd_string]
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True,
+        )
 
     def cleanup(self):
         """Stop and remove the container. Bind-mount dirs persist if persistent=True."""
         if self._container_id:
+            # Clean up snapshot and cwdfile inside the container
+            paths_to_rm = " ".join(
+                p for p in (self._snapshot_path, self._cwdfile_path) if p
+            )
+            if paths_to_rm:
+                try:
+                    subprocess.run(
+                        [self._docker_exe, "exec", self._container_id,
+                         "rm", "-f", *paths_to_rm.split()],
+                        capture_output=True, timeout=5,
+                    )
+                except Exception:
+                    pass
+
             try:
                 # Stop in background so cleanup doesn't block
                 stop_cmd = (
