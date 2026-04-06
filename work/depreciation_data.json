@@ -1,0 +1,129 @@
+{
+  "tiguan_2022_used": {
+    "vehicle": "Used 2022 VW Tiguan (80,000 km)",
+    "current_listed_price": 25000,
+    "description": "Already depreciated significantly; used car shallower curve",
+    "depreciation": {
+      "year_3": {
+        "year": 2029,
+        "vehicle_age": 7,
+        "est_km": 140000,
+        "depreciated_value": 15500,
+        "pct_of_current": 0.62,
+        "note": "~38% depreciation over 3 more years from used starting point"
+      },
+      "year_5": {
+        "year": 2031,
+        "vehicle_age": 9,
+        "est_km": 180000,
+        "depreciated_value": 11800,
+        "pct_of_current": 0.47,
+        "note": "~53% depreciation over 5 years from used point"
+      },
+      "year_7": {
+        "year": 2033,
+        "vehicle_age": 11,
+        "est_km": 230000,
+        "depreciated_value": 8200,
+        "pct_of_current": 0.33,
+        "note": "~67% depreciation - high mileage affects value"
+      },
+      "year_10": {
+        "year": 2036,
+        "vehicle_age": 14,
+        "est_km": 300000,
+        "depreciated_value": 4500,
+        "pct_of_current": 0.18,
+        "note": "Floor value approaching scrap/residual"
+      }
+    }
+  },
+  "tiguan_2026_new": {
+    "vehicle": "New 2026 VW Tiguan Highline Turbo R-Line 4MOTION",
+    "msrp": 48995,
+    "freight_pdi": 2200,
+    "omvic_fee": 22,
+    "admin_fee": 500,
+    "total_before_tax": 51717,
+    "total_with_hst": 58440.21,
+    "description": "New car, steeper initial depreciation",
+    "depreciation": {
+      "year_3": {
+        "year": 2029,
+        "vehicle_age": 3,
+        "est_km": 60000,
+        "remaining_pct": 0.62,
+        "depreciated_value": 32065,
+        "note": "~38% lost in first 3 years (matches KBB data)"
+      },
+      "year_5": {
+        "year": 2031,
+        "vehicle_age": 5,
+        "est_km": 100000,
+        "remaining_pct": 0.47,
+        "depreciated_value": 24307,
+        "note": "53% lost by year 5 - VW depreciation curve"
+      },
+      "year_7": {
+        "year": 2033,
+        "vehicle_age": 7,
+        "est_km": 140000,
+        "remaining_pct": 0.36,
+        "depreciated_value": 18618,
+        "note": "64% lost - entering high-mileage range"
+      },
+      "year_10": {
+        "year": 2036,
+        "vehicle_age": 10,
+        "est_km": 200000,
+        "remaining_pct": 0.23,
+        "depreciated_value": 11895,
+        "note": "77% lost - significant age and mileage"
+      }
+    }
+  },
+  "rav4_prime_2026": {
+    "vehicle": "New 2026 Toyota RAV4 Plug-in Hybrid XSE",
+    "estimated_xse_msrp": 52500,
+    "freight_pdi": 1895,
+    "total_before_tax": 54395,
+    "total_with_hst": 61466.35,
+    "izev_rebate": 2500,
+    "total_with_hst_minus_rebate": 58966.35,
+    "description": "Best-in-class resale value; PHEP demand exceeds supply",
+    "depreciation": {
+      "year_3": {
+        "year": 2029,
+        "vehicle_age": 3,
+        "est_km": 60000,
+        "remaining_pct": 0.72,
+        "depreciated_value": 39164,
+        "note": "Only 28% lost - best-in-class retention (KBB data)"
+      },
+      "year_5": {
+        "year": 2031,
+        "vehicle_age": 5,
+        "est_km": 100000,
+        "remaining_pct": 0.6,
+        "depreciated_value": 32637,
+        "note": "40% lost - still above average"
+      },
+      "year_7": {
+        "year": 2033,
+        "vehicle_age": 7,
+        "est_km": 140000,
+        "remaining_pct": 0.48,
+        "depreciated_value": 26110,
+        "note": "52% lost - Toyota reputation sustains value"
+      },
+      "year_10": {
+        "year": 2036,
+        "vehicle_age": 10,
+        "est_km": 200000,
+        "remaining_pct": 0.36,
+        "depreciated_value": 19582,
+        "note": "64% lost - still good for a 10-year-old SUV"
+      }
+    }
+  }
+}
