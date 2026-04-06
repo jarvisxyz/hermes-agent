@@ -84,6 +84,11 @@ class SlackAdapter(BasePlatformAdapter):
         self._seen_messages: Dict[str, float] = {}
         self._SEEN_TTL = 300   # 5 minutes
         self._SEEN_MAX = 2000  # prune threshold
+        # Thread history cache: (channel_id, thread_ts) → list of messages
+        # Caches recent thread history to avoid repeated API calls
+        self._thread_history_cache: Dict[tuple, list] = {}
+        self._THREAD_HISTORY_TTL = 60  # 1 minute cache TTL
+        self._THREAD_HISTORY_MAX = 100  # max cached threads
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -882,6 +887,18 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve user display name (cached after first lookup)
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
 
+        # Fetch and inject thread context if enabled and in a thread
+        include_thread_context = self.config.extra.get("include_thread_context", True)
+        if include_thread_context and thread_ts:
+            try:
+                thread_messages = await self._fetch_thread_history(channel_id, thread_ts)
+                if thread_messages:
+                    context_str = self._format_thread_context(thread_messages, ts)
+                    if context_str:
+                        text = f"{context_str}\n\n{text}"
+            except Exception as e:
+                logger.debug("[Slack] Failed to inject thread context: %s", e)
+
         # Build source
         source = self.build_source(
             chat_id=channel_id,
@@ -952,6 +969,132 @@ class SlackAdapter(BasePlatformAdapter):
         )
 
         await self.handle_message(event)
+
+    async def _fetch_thread_history(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        limit: int = 50,
+    ) -> list:
+        """Fetch message history from a Slack thread via conversations.replies.
+
+        Args:
+            channel_id: The Slack channel ID
+            thread_ts: The parent message timestamp (thread identifier)
+            limit: Maximum number of messages to fetch (excluding the parent)
+
+        Returns:
+            List of message dicts with user, text, and ts fields
+        """
+        if not self._app or not channel_id or not thread_ts:
+            return []
+
+        cache_key = (channel_id, thread_ts)
+        now = time.time()
+
+        # Check cache first
+        if cache_key in self._thread_history_cache:
+            cached = self._thread_history_cache[cache_key]
+            if cached and (now - cached[0].get("_cached_at", 0)) < self._THREAD_HISTORY_TTL:
+                logger.debug("[Slack] Using cached thread history for %s", thread_ts)
+                return cached[1:]  # Skip the cache metadata entry
+
+        try:
+            client = self._get_client(channel_id)
+            result = await client.conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                limit=limit + 1,  # +1 for the parent message
+            )
+
+            messages = result.get("messages", [])
+            if not messages:
+                return []
+
+            # Filter out bot messages and the parent message (first in list)
+            # Only include user messages
+            filtered = []
+            for msg in messages[1:]:  # Skip parent message
+                if msg.get("bot_id") or msg.get("subtype") == "bot_message":
+                    continue
+                # Skip message changes/deletions
+                if msg.get("subtype") in ("message_changed", "message_deleted"):
+                    continue
+                filtered.append({
+                    "user": msg.get("user", ""),
+                    "text": msg.get("text", ""),
+                    "ts": msg.get("ts", ""),
+                })
+
+            # Cache the result with metadata
+            cache_entry = [{"_cached_at": now}] + filtered
+            self._thread_history_cache[cache_key] = cache_entry
+
+            # Prune cache if needed
+            if len(self._thread_history_cache) > self._THREAD_HISTORY_MAX:
+                # Remove oldest entries
+                sorted_keys = sorted(
+                    self._thread_history_cache.keys(),
+                    key=lambda k: -(self._thread_history_cache[k][0].get("_cached_at", 0))
+                )
+                for old_key in sorted_keys[self._THREAD_HISTORY_MAX:]:
+                    del self._thread_history_cache[old_key]
+
+            logger.debug(
+                "[Slack] Fetched %d messages from thread %s",
+                len(filtered), thread_ts
+            )
+            return filtered
+
+        except Exception as e:
+            logger.warning("[Slack] Failed to fetch thread history: %s", e)
+            return []
+
+    def _format_thread_context(
+        self,
+        messages: list,
+        current_ts: str,
+        max_messages: int = 20,
+    ) -> str:
+        """Format thread history messages as context string.
+
+        Args:
+            messages: List of message dicts from _fetch_thread_history
+            current_ts: Timestamp of the current message to exclude
+            max_messages: Maximum messages to include in context
+
+        Returns:
+            Formatted context string or empty string if no context
+        """
+        if not messages:
+            return ""
+
+        # Filter out the current message and take most recent N
+        filtered = [m for m in messages if m.get("ts") != current_ts]
+        if not filtered:
+            return ""
+
+        # Take last N messages (most recent)
+        recent = filtered[-max_messages:]
+
+        lines = ["--- Thread Context ---"]
+        for msg in recent:
+            user_id = msg.get("user", "")
+            text = msg.get("text", "")
+            if not text:
+                continue
+
+            # Resolve user name
+            user_name = self._user_name_cache.get(user_id, user_id)
+
+            # Strip bot mentions from text
+            for bot_uid in self._team_bot_user_ids.values():
+                text = text.replace(f"<@{bot_uid}>", "").strip()
+
+            lines.append(f"[{user_name}]: {text}")
+
+        lines.append("--- End Context ---\n")
+        return "\n".join(lines)
 
     def _has_active_session_for_thread(
         self,
