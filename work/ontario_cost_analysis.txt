@@ -1,0 +1,90 @@
+
+=======================================================================
+ONTARIO ANNUAL COST COMPARISON — 16,000 km/year
+Kitchener–Waterloo driver
+=======================================================================
+
+PRICING INPUTS:
+────────────────
+  Gas – Regular 87 octane (Toyota):     $1.559 /L  (Ontario avg Mar 2026)
+  Gas – Premium 91+ octane (VW):        $1.829 /L  (+$0.27/L premium)
+  Electricity – Off-peak TOU:           $0.087/kWh  (OEB Nov 2025, 7pm–7am)
+
+=======================================================================
+                    2022 TIGUAN    2026 TIGUAN    2026 RAV4 PRIME
+                     USED GAS      NEW GAS         XSE PHEV
+──────────────────────────────────────────────────────────────────────
+Fuel – Gasoline         $2,926       $2,780            $567
+Fuel – Electricity           –            –            $217
+FUEL TOTAL                $2,926       $2,780            $784
+
+Insurance                 $1,650       $2,150          $2,250
+(mo. equiv.)                $138         $179            $188
+
+Maintenance               $1,200         $850            $550
+
+Registration                 $100         $100            $100
+──────────────────────────────────────────────────────────────────────
+TOTAL ANNUAL COST         $5,876       $5,880          $3,684
+(per km)                  $0.368       $0.368          $0.230
+──────────────────────────────────────────────────────────────────────
+
+RAV4 PRIME FUEL BREAKDOWN:
+──────────────────────────
+  Electric driving:  10,400 km/yr  (65% of total)
+  Gas driving:        5,600 km/yr  (35% of total)
+  Electric cost:     $217/yr  (2,496 kWh × $0.087)
+  Gas cost:          $567/yr  (364 L × $1.559)
+  Combined fuel:     $784/yr  →  only $4.90 per 100 km
+
+  Vs. gas-only SUV:  Saves ~$2,100/year on fuel alone
+  Vs. gas-only SUV:  Saves ~$2,200/year total ($37/week)
+
+=======================================================================
+KEY TAKEAWAYS:
+──────────────
+1. The 2022 used Tiguan and 2026 new Tiguan have nearly
+   identical annual operating costs ($5,876 vs $5,880).
+   The new car's slightly lower fuel + maintenance is
+   offset by much higher insurance.
+
+2. The RAV4 Prime PHEV saves ~$2,200/year in operating
+   costs vs either Tiguan ($3,684 vs $5,876–5,880).
+
+3. At 65% electric split, a home-charged RAV4 Prime driver
+   would only fill gas ~6–8 times per year, using only
+   ~364 L annually vs 1,600 L (used Tiguan) or 1,520 L
+   (new Tiguan).
+
+4. The RAV4 Prime's higher purchase price (~$62K with HST
+   vs $25K–$58K) is partially offset by fuel + maintenance
+   savings of ~$2,500–3,400/year. Break-even on the premium
+   (vs used Tiguan) in ~15 years on TCO alone, or ~7 years
+   vs the new Tiguan if fuel + maintenance savings are
+   compared to the new-car insurance + fuel premium.
+
+5. Insurance is a significant variable – the above uses
+   Kitchener-Waterloo averages (10–15% below GTA).
+   Actual quotes depend heavily on driving record, age,
+   and bundling.
+
+=======================================================================
+COST ASSUMPTIONS & SOURCES:
+─────────────────────────────
+• Gas:    GlobalPetrolPrices Ontario avg March 2026
+          GasWizard.ca price history, Ontario.ca
+          Range in recent months: $1.40–$1.91/L
+• Premium: +$0.27/L over regular (Ontario.ca price data)
+• Electricity: OEB TOU effective Nov 1 2025
+          Off-peak: $0.087/kWh (7pm–7am weekdays, all day weekends)
+          Also available: ULO overnight $0.087/kWh
+• Maintenance: VW 10-yr/160K km = $8,185 (CarEdge)
+               Toyota RAV4 Prime 10-yr = $6,200 (CarEdge)
+• Insurance: Ontario avg $2,120/yr, Kitchener-Waterloo
+          10–15% below GTA. Vehicle value & type adjustment.
+          Source: ThinkInsure.ca, Ratehub.ca, MyChoice.ca
+• RAV4 Prime electric efficiency: 24 kWh/100km real-world
+• Toyota MSRP from Toyota Canada media (Jan 2026):
+          RAV4 Prime XSE: $52,408 MSRP
+• VW 2026 Tiguan MSRP: ~$48,995 (Highline R-Line)
+=======================================================================
