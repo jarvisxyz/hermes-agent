@@ -300,6 +300,80 @@ def _resolve_slack_proxy_url() -> Optional[str]:
     return proxy_url
 
 
+def _markdown_to_blocks(content: str, max_text_length: int = 3000) -> list:
+    """Convert a markdown string into Slack Block Kit section blocks.
+
+    Splits on markdown headers (## ...) to create separate section blocks,
+    which gives Slack a visually richer layout with implicit spacing between
+    sections.  Content without headers is returned as a single section block.
+
+    Falls back gracefully — if the content cannot be meaningfully split, a
+    single section block wrapping the whole content is returned.  Never
+    returns more than 50 blocks (Slack's limit).
+
+    This is intentionally conservative: it does NOT attempt to convert
+    lists, tables, or code blocks into separate block types.  Those remain
+    as mrkdwn text within their section, which Slack already renders well.
+    The primary win is header-based section splitting for visual hierarchy.
+    """
+    if not content:
+        return []
+
+    # Split on markdown headers (## Title, ### Title, etc.)
+    # Each header starts a new section block.
+    parts = re.split(r"\n(?=#{1,6}\s)", content)
+
+    blocks = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # Slack section text limit is 3000 chars.  Truncate long sections.
+        text = part if len(part) <= max_text_length else part[:max_text_length - 3] + "..."
+
+        # Convert the header line to bold mrkdwn if present.
+        # ## Title → *Title* (Slack bold, which renders large)
+        # ### Title → _*Title*_ (bold+italic for h3)
+        lines = text.split("\n")
+        first_line = lines[0].strip()
+        if re.match(r"^#{1,6}\s+", first_line):
+            header_match = re.match(r"^(#{1,6})\s+(.+)$", first_line)
+            if header_match:
+                level = len(header_match.group(1))
+                title = header_match.group(2).strip()
+                # Strip any remaining markdown bold/italic markers
+                title = re.sub(r"\*{1,3}(.*?)\*{1,3}", r"\1", title)
+                if level <= 2:
+                    lines[0] = f"*{title}*"
+                else:
+                    lines[0] = f"_{title}_"
+            text = "\n".join(lines)
+
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": text,
+            },
+        })
+
+        if len(blocks) >= 49:  # Reserve 1 slot for potential divider/context
+            break
+
+    # Add dividers between sections if there are 2+ section blocks
+    if len(blocks) > 1:
+        interleaved = []
+        for i, block in enumerate(blocks):
+            interleaved.append(block)
+            if i < len(blocks) - 1:
+                interleaved.append({"type": "divider"})
+        blocks = interleaved
+
+    # Slack allows max 50 blocks per message
+    return blocks[:50]
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
@@ -335,6 +409,12 @@ class SlackAdapter(BasePlatformAdapter):
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
+        # Track clarify prompt state: clarify_id → session_key, used by
+        # Block Kit button callbacks to resolve the correct clarify entry.
+        self._clarify_state: Dict[str, str] = {}
+        # Track clarify choices: clarify_id → list of choice strings, so
+        # button callbacks can map index → choice text.
+        self._clarify_choices: Dict[str, list] = {}
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set = set()
@@ -943,6 +1023,13 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
 
+            # Register Block Kit action handlers for clarify prompt buttons.
+            # All choice buttons share action_id "hermes_clarify_choice" with
+            # the choice index encoded in the value field.  The "Other" button
+            # uses "hermes_clarify_other" and triggers text-capture mode.
+            self._app.action("hermes_clarify_choice")(self._handle_clarify_choice_action)
+            self._app.action("hermes_clarify_other")(self._handle_clarify_other_action)
+
             # Bring up the handler and watchdog atomically. ``_running`` only
             # flips to True after the handler is alive so the watchdog loop
             # observes the live task immediately; on any failure here we tear
@@ -1081,6 +1168,57 @@ class SlackAdapter(BasePlatformAdapter):
             # Convert standard markdown → Slack mrkdwn
             formatted = self.format_message(content)
 
+            # Try Block Kit rich rendering when the content has
+            # structural markers (headers) that benefit from section
+            # splitting.  Falls back to plain text for simple messages.
+            rich_enabled = self.config.extra.get("rich_messages", True)
+            blocks = None
+            if rich_enabled:
+                blocks = _markdown_to_blocks(formatted)
+                # Only use blocks when they add value (2+ sections).
+                # A single section wrapping plain text offers no visual
+                # improvement over mrkdwn text and can break URL unfurling.
+                if len(blocks) <= 1:
+                    blocks = None
+
+            if blocks:
+                # Block Kit path — send as rich blocks.
+                thread_ts = self._resolve_thread_ts(reply_to, metadata)
+                broadcast = self.config.extra.get("reply_broadcast", False)
+
+                kwargs: Dict[str, Any] = {
+                    "channel": chat_id,
+                    "text": formatted[:4000] if len(formatted) > 4000 else formatted,
+                    "blocks": blocks,
+                    "mrkdwn": True,
+                }
+                if thread_ts:
+                    kwargs["thread_ts"] = thread_ts
+                    if broadcast:
+                        kwargs["reply_broadcast"] = True
+
+                result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+                sent_ts = result.get("ts") if result else None
+
+                if sent_ts:
+                    self._bot_message_ts.add(sent_ts)
+                    if thread_ts:
+                        self._bot_message_ts.add(thread_ts)
+                    if len(self._bot_message_ts) > self._BOT_TS_MAX:
+                        excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
+                        for old_ts in list(self._bot_message_ts)[:excess]:
+                            self._bot_message_ts.discard(old_ts)
+
+                if thread_ts:
+                    await self.stop_typing(chat_id)
+
+                return SendResult(
+                    success=True,
+                    message_id=sent_ts,
+                    raw_response=result,
+                )
+
+            # Plain-text path (original behavior)
             # Split long messages, preserving code block boundaries
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
@@ -1181,11 +1319,28 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
-            await self._get_client(chat_id).chat_update(
-                channel=chat_id,
-                ts=message_id,
-                text=formatted,
-            )
+
+            # Try Block Kit rendering for edited messages with structure.
+            rich_enabled = self.config.extra.get("rich_messages", True)
+            blocks = None
+            if rich_enabled:
+                blocks = _markdown_to_blocks(formatted)
+                if len(blocks) <= 1:
+                    blocks = None
+
+            if blocks:
+                await self._get_client(chat_id).chat_update(
+                    channel=chat_id,
+                    ts=message_id,
+                    text=formatted[:4000] if len(formatted) > 4000 else formatted,
+                    blocks=blocks,
+                )
+            else:
+                await self._get_client(chat_id).chat_update(
+                    channel=chat_id,
+                    ts=message_id,
+                    text=formatted,
+                )
             if finalize:
                 await self.stop_typing(chat_id)
             return SendResult(success=True, message_id=message_id)
@@ -1198,6 +1353,45 @@ class SlackAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    @staticmethod
+    def _build_progress_blocks(lines: list, max_chars: int = 2900) -> list:
+        """Build Block Kit blocks for tool-call progress messages.
+
+        Renders a section block with the accumulated progress lines and a
+        context block showing a subtle "running tools…" indicator.  This
+        gives tool-call progress a richer visual presentation than plain
+        text while staying compact enough for frequent edits.
+
+        Returns a list of Block Kit block dicts suitable for the ``blocks``
+        parameter of ``chat_postMessage`` or ``chat_update``.
+        """
+        if not lines:
+            return []
+
+        text = "\n".join(str(line) for line in lines)
+        if len(text) > max_chars:
+            text = text[: max_chars - 3] + "..."
+
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": text,
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "⏳ _Running tools…_",
+                    },
+                ],
+            },
+        ]
+        return blocks
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.
@@ -2797,6 +2991,135 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] send_slash_confirm failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Block Kit clarify prompt with interactive buttons.
+
+        Multi-choice mode (``choices`` non-empty): renders one button per
+        option (up to 5; longer lists fall back to numbered text with an
+        "Other" button) plus a final "✏️ Other" button.  Button callbacks
+        resolve via
+        ``tools.clarify_gateway.resolve_gateway_clarify(clarify_id, response)``.
+        Picking the "Other" button calls
+        ``mark_awaiting_text(clarify_id)`` so the next user message in the
+        session is captured as the free-text response.
+
+        Open-ended mode (``choices`` empty): renders the question as plain
+        text — no buttons.  The next message in the session is captured by
+        the gateway's text-intercept and resolves the clarify automatically.
+        """
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+
+        # Open-ended — no buttons to render, fall back to plain text.
+        if not choices:
+            text = f"❓ {question}"
+            return await self.send(
+                chat_id=chat_id,
+                content=text,
+                metadata=metadata,
+            )
+
+        try:
+            question_text = (
+                question[:2900] + "..." if len(question) > 2900 else question
+            )
+            thread_ts = self._resolve_thread_ts(None, metadata)
+
+            # Section block with the question
+            blocks = [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"❓ *{question_text}*",
+                    },
+                }
+            ]
+
+            if len(choices) <= 5:
+                # Render each choice as a button.
+                button_elements = []
+                for idx, choice in enumerate(choices):
+                    label = str(choice)[:75]  # Slack button text limit
+                    button_elements.append(
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": label},
+                            "action_id": "hermes_clarify_choice",
+                            "value": f"{clarify_id}:{idx}",
+                        }
+                    )
+                # "Other" button for free-text
+                button_elements.append(
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✏️ Other"},
+                        "action_id": "hermes_clarify_other",
+                        "value": clarify_id,
+                    }
+                )
+                blocks.append({"type": "actions", "elements": button_elements})
+            else:
+                # Too many choices for buttons — render as numbered list
+                # with an "Other" button only.  User replies with a number
+                # or free text; text-capture handles resolution.
+                option_lines = "\n".join(
+                    f"  {i + 1}. {str(c)}" for i, c in enumerate(choices)
+                )
+                blocks[0]["text"]["text"] = (
+                    f"❓ *{question_text}*\n\n{option_lines}"
+                )
+                blocks.append(
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": "✏️ Other",
+                                },
+                                "action_id": "hermes_clarify_other",
+                                "value": clarify_id,
+                            }
+                        ],
+                    }
+                )
+                # Enable text-capture for numbered/free-text replies
+                from tools.clarify_gateway import mark_awaiting_text
+
+                mark_awaiting_text(clarify_id)
+
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": f"❓ {question_text}",
+                "blocks": blocks,
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+
+            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            msg_ts = result.get("ts", "")
+
+            # Track clarify state for button callback resolution
+            self._clarify_state[clarify_id] = session_key
+            self._clarify_choices[clarify_id] = list(choices)
+
+            return SendResult(
+                success=True, message_id=msg_ts, raw_response=result
+            )
+        except Exception as e:
+            logger.error("[Slack] send_clarify failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""
         await ack()
@@ -2904,6 +3227,182 @@ class SlackAdapter(BasePlatformAdapter):
                 exc,
                 exc_info=True,
             )
+
+    async def _handle_clarify_choice_action(self, ack, body, action) -> None:
+        """Handle a clarify choice button click from Block Kit."""
+        await ack()
+
+        value = action.get("value", "")
+        # value format: "clarify_id:choice_index"
+        if ":" not in value:
+            logger.warning("[Slack] Malformed clarify choice value: %s", value)
+            return
+
+        clarify_id, idx_str = value.split(":", 1)
+        session_key = self._clarify_state.pop(clarify_id, "")
+        choices = self._clarify_choices.pop(clarify_id, [])
+
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        # Authorization — reuse the approval allowlist.
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {
+                uid.strip() for uid in allowed_csv.split(",") if uid.strip()
+            }
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized clarify click by %s (%s) — ignoring",
+                    user_name,
+                    user_id,
+                )
+                return
+
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            logger.warning(
+                "[Slack] Non-numeric clarify index: %s", idx_str
+            )
+            return
+
+        choice_text = (
+            str(choices[idx]) if 0 <= idx < len(choices) else str(idx)
+        )
+
+        # Update the message to show the selection and remove buttons.
+        original_text = ""
+        for block in message.get("blocks", []):
+            if block.get("type") == "section":
+                original_text = block.get("text", {}).get("text", "")
+                break
+
+        decision_text = f"✅ Selected by {user_name}: {choice_text}"
+        updated_blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": original_text or "Clarification prompt",
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": decision_text},
+                ],
+            },
+        ]
+
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id,
+                ts=msg_ts,
+                text=decision_text,
+                blocks=updated_blocks,
+            )
+        except Exception as e:
+            logger.warning(
+                "[Slack] Failed to update clarify message: %s", e
+            )
+
+        # Resolve the clarify — this unblocks the agent thread.
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+
+            resolve_gateway_clarify(clarify_id, choice_text)
+            logger.info(
+                "Slack button resolved clarify for %s (choice=%s, user=%s)",
+                session_key,
+                choice_text,
+                user_name,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to resolve clarify from Slack button: %s",
+                exc,
+                exc_info=True,
+            )
+
+    async def _handle_clarify_other_action(self, ack, body, action) -> None:
+        """Handle the "Other" clarify button — switches to text-capture mode."""
+        await ack()
+
+        clarify_id = action.get("value", "")
+        session_key = self._clarify_state.pop(clarify_id, "")
+        # Keep _clarify_choices entry so the text-intercept path can still
+        # match numeric replies if the user types "2" instead of free text.
+
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        # Authorization — reuse the approval allowlist.
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {
+                uid.strip() for uid in allowed_csv.split(",") if uid.strip()
+            }
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized clarify click by %s (%s) — ignoring",
+                    user_name,
+                    user_id,
+                )
+                return
+
+        # Switch to text-capture mode so the next message resolves the clarify.
+        from tools.clarify_gateway import mark_awaiting_text
+
+        mark_awaiting_text(clarify_id)
+
+        # Update the message to show "waiting for text" and remove buttons.
+        original_text = ""
+        for block in message.get("blocks", []):
+            if block.get("type") == "section":
+                original_text = block.get("text", {}).get("text", "")
+                break
+
+        waiting_text = f"✏️ Waiting for your answer… (clicked by {user_name})"
+        updated_blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": original_text or "Clarification prompt",
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {"type": "mrkdwn", "text": waiting_text},
+                ],
+            },
+        ]
+
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id,
+                ts=msg_ts,
+                text=waiting_text,
+                blocks=updated_blocks,
+            )
+        except Exception as e:
+            logger.warning(
+                "[Slack] Failed to update clarify message: %s", e
+            )
+
+        logger.info(
+            "Slack button switched clarify to text-capture for %s (user=%s)",
+            session_key,
+            user_name,
+        )
 
     async def _handle_approval_action(self, ack, body, action) -> None:
         """Handle an approval button click from Block Kit."""
