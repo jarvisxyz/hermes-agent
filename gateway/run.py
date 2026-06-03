@@ -16747,6 +16747,13 @@ class GatewayRunner:
             # Finalize stream consumer
             if _stream_consumer:
                 _stream_consumer.finish()
+                # Pass captured thinking content to the adapter so it can
+                # include a Block Kit thinking toggle in the response.
+                _store_fn = getattr(_adapter, "store_thinking_content", None)
+                if _store_fn and callable(_store_fn):
+                    _thinking = _stream_consumer.thinking_content
+                    if _thinking:
+                        _store_fn(source.chat_id, _thinking, session_key or "")
             if stream_task:
                 try:
                     await asyncio.wait_for(stream_task, timeout=5.0)
@@ -18135,6 +18142,18 @@ class GatewayRunner:
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
+                # Pass captured thinking content to the adapter so it can
+                # include a Block Kit thinking toggle in the response.
+                try:
+                    _local_adapter = _adapter  # type: ignore[possibly-undefined]
+                    if _local_adapter is not None:
+                        _store_fn2 = getattr(_local_adapter, "store_thinking_content", None)
+                        if _store_fn2 and callable(_store_fn2):
+                            _thinking2 = _stream_consumer.thinking_content
+                            if _thinking2:
+                                _store_fn2(source.chat_id, _thinking2, session_key or "")
+                except NameError:
+                    pass
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
