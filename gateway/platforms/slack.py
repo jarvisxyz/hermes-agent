@@ -38,6 +38,29 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
+from gateway.platforms.slack_blocks import (
+    markdown_to_blocks,
+    build_approval_blocks,
+    build_resolved_approval_blocks,
+    build_slash_confirm_blocks,
+    build_resolved_confirm_blocks,
+    build_clarify_blocks,
+    build_status_footer,
+    build_thinking_toggle_block,
+    build_thinking_reveal_blocks,
+    build_thinking_collapsed_block,
+    build_model_selector_block,
+    build_reasoning_level_block,
+    build_tool_progress_blocks,
+    build_session_controls_block,
+    button_element,
+    option_object,
+    static_select_element,
+    actions_block,
+    context_block,
+    section_block,
+    MAX_BLOCKS_PER_MESSAGE,
+)
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -335,6 +358,22 @@ class SlackAdapter(BasePlatformAdapter):
         # Track pending approval message_ts → resolved flag to prevent
         # double-clicks on approval buttons.
         self._approval_resolved: Dict[str, bool] = {}
+        # Track clarify prompt state: clarify_id → session_key, used by
+        # Block Kit button callbacks to resolve the correct clarify entry.
+        self._clarify_state: Dict[str, str] = {}
+        # Track clarify choices: clarify_id → list of choice strings, so
+        # button callbacks can map index → choice text.
+        self._clarify_choices: Dict[str, list] = {}
+        # Track thinking content for toggle: session_key → thinking_text,
+        # so the hide/show toggle can update the message with or without
+        # the reasoning content.
+        self._thinking_state: Dict[str, str] = {}
+        # Whether to use Block Kit rich messages (Slack Block Kit v2).
+        # Controlled via platform config: gateway.slack.rich_messages
+        self._rich_messages: bool = self.config.extra.get("rich_messages", False)
+        # Track pending thinking content per chat for append to next send.
+        # chat_id → thinking_text.  Populated by store_thinking_content().
+        self._pending_thinking: Dict[str, str] = {}
         # Track timestamps of messages sent by the bot so we can respond
         # to thread replies even without an explicit @mention.
         self._bot_message_ts: set = set()
@@ -943,6 +982,19 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
 
+            # Register Block Kit action handlers for clarify prompt buttons.
+            # All choice buttons share action_id "hermes_clarify_choice" with
+            # the choice index encoded in the value field.  The "Other" button
+            # uses "hermes_clarify_other" and triggers text-capture mode.
+            self._app.action("hermes_clarify_choice")(self._handle_clarify_choice_action)
+            self._app.action("hermes_clarify_other")(self._handle_clarify_other_action)
+
+            # Register Block Kit action handlers for thinking toggle,
+            # model selector, and reasoning level dropdowns.
+            self._app.action("hermes_thinking_toggle")(self._handle_thinking_toggle_action)
+            self._app.action("hermes_model_select")(self._handle_model_select_action)
+            self._app.action("hermes_reasoning_select")(self._handle_reasoning_select_action)
+
             # Bring up the handler and watchdog atomically. ``_running`` only
             # flips to True after the handler is alive so the watchdog loop
             # observes the live task immediately; on any failure here we tear
@@ -1061,7 +1113,15 @@ class SlackAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a message to a Slack channel or DM."""
+        """Send a message to a Slack channel or DM.
+
+        When ``rich_messages`` is enabled (via
+        ``gateway.slack.rich_messages: true`` in platform config), the
+        message is formatted as Block Kit sections using
+        ``markdown_to_blocks``.  If thinking content was stored via
+        ``store_thinking_content``, a collapsed thinking-toggle block
+        is appended to the first chunk.
+        """
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
@@ -1091,8 +1151,12 @@ class SlackAdapter(BasePlatformAdapter):
             # Controlled via platform config: gateway.slack.reply_broadcast
             broadcast = self.config.extra.get("reply_broadcast", False)
 
+            # Pending thinking content — attach collapsed toggle to the
+            # first chunk when rich_messages is enabled.
+            pending_thinking = self._pending_thinking.pop(chat_id, "")
+
             for i, chunk in enumerate(chunks):
-                kwargs = {
+                kwargs: Dict[str, Any] = {
                     "channel": chat_id,
                     "text": chunk,
                     "mrkdwn": True,
@@ -1102,6 +1166,33 @@ class SlackAdapter(BasePlatformAdapter):
                     # Only broadcast the first chunk of the first reply
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
+
+                # Build Block Kit rich message for the first chunk when enabled
+                if self._rich_messages and i == 0:
+                    blocks = markdown_to_blocks(chunk)
+
+                    # Append thinking toggle if we have stored thinking content
+                    if pending_thinking:
+                        session_key = metadata.get("session_key", "") if metadata else ""
+                        if not session_key:
+                            # Generate a stable key from chat_id + thread_ts
+                            session_key = f"{chat_id}:{thread_ts or 'dm'}"
+                        thinking_block = build_thinking_collapsed_block(
+                            "💭 Thinking used", session_key
+                        )
+                        blocks.append(thinking_block)
+                        # Store thinking content for the toggle handler
+                        self._thinking_state[session_key] = pending_thinking
+
+                    # Append status footer
+                    footer = build_status_footer()
+                    if footer:
+                        blocks.append(footer)
+
+                    # Enforce Slack's 50-block limit
+                    if len(blocks) <= MAX_BLOCKS_PER_MESSAGE:
+                        kwargs["blocks"] = blocks
+                        # Fallback text stays as-is for notifications
 
                 last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
 
@@ -1127,6 +1218,7 @@ class SlackAdapter(BasePlatformAdapter):
                 message_id=sent_ts,
                 raw_response=last_result,
             )
+
 
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[Slack] Send error: %s", e, exc_info=True)
@@ -1198,6 +1290,25 @@ class SlackAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    def store_thinking_content(self, chat_id: str, thinking_text: str, session_key: str = "") -> None:
+        """Store thinking/reasoning content for a chat session.
+
+        Called by the gateway after a stream completes (when the stream
+        consumer captured thinking content from ``utowired`` tags).  The
+        next ``send()`` call for this ``chat_id`` will include a
+        Block Kit thinking toggle block (if ``rich_messages`` is enabled).
+
+        ``session_key`` is stored in ``_thinking_state`` so the toggle
+        action handler can look up the content by key.
+        """
+        if not thinking_text or not thinking_text.strip():
+            return
+        # Truncate to a reasonable length for Slack display
+        truncated = thinking_text[:4000]
+        self._pending_thinking[chat_id] = truncated
+        if session_key:
+            self._thinking_state[session_key] = truncated
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.
@@ -2663,50 +2774,11 @@ class SlackAdapter(BasePlatformAdapter):
             cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
             thread_ts = self._resolve_thread_ts(None, metadata)
 
-            blocks = [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": (
-                            f":warning: *Command Approval Required*\n"
-                            f"```{cmd_preview}```\n"
-                            f"Reason: {description}"
-                        ),
-                    },
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Allow Once"},
-                            "style": "primary",
-                            "action_id": "hermes_approve_once",
-                            "value": session_key,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Allow Session"},
-                            "action_id": "hermes_approve_session",
-                            "value": session_key,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Always Allow"},
-                            "action_id": "hermes_approve_always",
-                            "value": session_key,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Deny"},
-                            "style": "danger",
-                            "action_id": "hermes_deny",
-                            "value": session_key,
-                        },
-                    ],
-                },
-            ]
+            blocks = build_approval_blocks(
+                cmd_preview,
+                session_key,
+                dangerous="dangerous" in description.lower(),
+            )
 
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
@@ -2742,44 +2814,13 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             body = message[:2900] + "..." if len(message) > 2900 else message
             thread_ts = self._resolve_thread_ts(None, metadata)
-            # Encode session_key and confirm_id into the button value so the
-            # callback handler can resolve without extra bookkeeping.
-            value = f"{session_key}|{confirm_id}"
 
-            blocks = [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*{title or 'Confirm'}*\n\n{body}",
-                    },
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Approve Once"},
-                            "style": "primary",
-                            "action_id": "hermes_confirm_once",
-                            "value": value,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Always Approve"},
-                            "action_id": "hermes_confirm_always",
-                            "value": value,
-                        },
-                        {
-                            "type": "button",
-                            "text": {"type": "plain_text", "text": "Cancel"},
-                            "style": "danger",
-                            "action_id": "hermes_confirm_cancel",
-                            "value": value,
-                        },
-                    ],
-                },
-            ]
+            blocks = build_slash_confirm_blocks(
+                title or "Confirm",
+                body,
+                session_key,
+                confirm_id,
+            )
 
             kwargs: Dict[str, Any] = {
                 "channel": chat_id,
@@ -2849,21 +2890,9 @@ class SlackAdapter(BasePlatformAdapter):
                 original_text = block.get("text", {}).get("text", "")
                 break
 
-        updated_blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": original_text or "Confirmation prompt",
-                },
-            },
-            {
-                "type": "context",
-                "elements": [
-                    {"type": "mrkdwn", "text": decision_text},
-                ],
-            },
-        ]
+        updated_blocks = build_resolved_confirm_blocks(
+            original_text, decision_text
+        )
 
         try:
             await self._get_client(channel_id).chat_update(
@@ -2960,21 +2989,9 @@ class SlackAdapter(BasePlatformAdapter):
                 original_text = block.get("text", {}).get("text", "")
                 break
 
-        updated_blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": original_text or "Command approval request",
-                },
-            },
-            {
-                "type": "context",
-                "elements": [
-                    {"type": "mrkdwn", "text": decision_text},
-                ],
-            },
-        ]
+        updated_blocks = build_resolved_approval_blocks(
+            original_text, decision_text
+        )
 
         try:
             await self._get_client(channel_id).chat_update(
@@ -3004,6 +3021,371 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         # (approval state already consumed by atomic pop above)
+
+    # ----- Clarify prompt support (Block Kit) -----
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Block Kit clarify prompt with interactive buttons.
+
+        Multi-choice mode (``choices`` non-empty): renders one button per
+        option (up to 5; longer lists fall back to numbered text with an
+        "Other" button) plus a final "✏️ Other" button.  Button callbacks
+        resolve via
+        ``tools.clarify_gateway.resolve_gateway_clarify(clarify_id, response)``.
+        Picking the "Other" button calls
+        ``mark_awaiting_text(clarify_id)`` so the next user message in the
+        session is captured as the free-text response.
+
+        Open-ended mode (``choices`` empty): renders the question as plain
+        text — no buttons.  The next message in the session is captured by
+        the gateway's text-intercept and resolves the clarify automatically.
+        """
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+
+        # Open-ended — no buttons to render, fall back to plain text.
+        if not choices:
+            text = f"❓ {question}"
+            return await self.send(
+                chat_id=chat_id,
+                content=text,
+                metadata=metadata,
+            )
+
+        try:
+            thread_ts = self._resolve_thread_ts(None, metadata)
+
+            blocks = build_clarify_blocks(question, choices, clarify_id)
+
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": f"❓ {question}",
+                "blocks": blocks,
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+
+            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            msg_ts = result.get("ts", "")
+
+            # Track clarify state for button callback resolution
+            self._clarify_state[clarify_id] = session_key
+            self._clarify_choices[clarify_id] = list(choices)
+
+            return SendResult(
+                success=True, message_id=msg_ts, raw_response=result
+            )
+        except Exception as e:
+            logger.error("[Slack] send_clarify failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
+    async def _handle_clarify_choice_action(self, ack, body, action) -> None:
+        """Handle a clarify choice button click from Block Kit."""
+        await ack()
+
+        value = action.get("value", "")
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        # Authorization
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized clarify click by %s (%s) — ignoring",
+                    user_name, user_id,
+                )
+                return
+
+        # Parse clarify_id:choice_index from value
+        if ":" not in value:
+            logger.warning("[Slack] Malformed clarify value: %s", value)
+            return
+        clarify_id, idx_str = value.split(":", 1)
+        try:
+            choice_idx = int(idx_str)
+        except ValueError:
+            logger.warning("[Slack] Non-integer clarify index: %s", idx_str)
+            return
+
+        # Look up the choice text
+        choices = self._clarify_choices.get(clarify_id, [])
+        if choice_idx < 0 or choice_idx >= len(choices):
+            logger.warning("[Slack] Clarify index out of range: %d (len=%d)", choice_idx, len(choices))
+            return
+
+        choice_text = str(choices[choice_idx])
+
+        # Resolve the clarify
+        session_key = self._clarify_state.get(clarify_id, "")
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+            resolve_gateway_clarify(clarify_id, choice_text)
+            logger.info(
+                "[Slack] Clarify resolved: clarify_id=%s choice=%s user=%s",
+                clarify_id, choice_text, user_name,
+            )
+        except Exception as exc:
+            logger.error("[Slack] Failed to resolve clarify from button: %s", exc)
+
+        # Update the message to show the selection
+        decision_text = f"✅ Selected by {user_name}: {choice_text[:75]}"
+        updated_blocks = build_resolved_confirm_blocks(
+            f"❓ Clarification", decision_text
+        )
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id,
+                ts=msg_ts,
+                text=decision_text,
+                blocks=updated_blocks,
+            )
+        except Exception as e:
+            logger.warning("[Slack] Failed to update clarify message: %s", e)
+
+        # Clean up state
+        self._clarify_state.pop(clarify_id, None)
+        self._clarify_choices.pop(clarify_id, None)
+
+    async def _handle_clarify_other_action(self, ack, body, action) -> None:
+        """Handle the "Other" clarify button — switches to text-capture mode."""
+        await ack()
+
+        clarify_id = action.get("value", "")
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        # Authorization
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized clarify-other click by %s (%s) — ignoring",
+                    user_name, user_id,
+                )
+                return
+
+        # Enable text-capture for the next user message
+        try:
+            from tools.clarify_gateway import mark_awaiting_text
+            mark_awaiting_text(clarify_id)
+        except Exception as exc:
+            logger.error("[Slack] Failed to mark clarify awaiting text: %s", exc)
+
+        # Update the message to indicate free-text mode
+        hint_text = f"✏️ {user_name} chose free-text — type your answer below"
+        updated_blocks = [
+            section_block(f"❓ *Clarification* — type your answer"),
+            context_block([{"type": "mrkdwn", "text": hint_text}]),
+        ]
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id,
+                ts=msg_ts,
+                text=hint_text,
+                blocks=updated_blocks,
+            )
+        except Exception as e:
+            logger.warning("[Slack] Failed to update clarify-other message: %s", e)
+
+    # ----- Thinking toggle support (Block Kit) -----
+
+    async def _handle_thinking_toggle_action(self, ack, body, action) -> None:
+        """Handle a thinking/reasoning toggle button click."""
+        await ack()
+
+        value = action.get("value", "")
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_id = body.get("user", {}).get("id", "")
+
+        # Authorization
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                return
+
+        # Parse session_key:on/off from value
+        if ":" not in value:
+            return
+        session_key, state = value.split(":", 1)
+
+        # Look up the thinking content
+        thinking_text = self._thinking_state.get(session_key, "")
+        if not thinking_text:
+            # No thinking content stored — just acknowledge
+            return
+
+        # Build updated blocks: either reveal or collapse
+        if state == "off":
+            # Collapse — replace thinking content with a context indicator
+            new_blocks = [
+                build_thinking_collapsed_block("💭 Thinking used", session_key),
+            ]
+        else:
+            # Reveal — show thinking content + hide button
+            new_blocks = build_thinking_reveal_blocks(
+                thinking_text, session_key
+            )
+
+        # We need to preserve any non-thinking blocks from the original message
+        existing_blocks = message.get("blocks", [])
+        preserved = [
+            b for b in existing_blocks
+            if not b.get("block_id", "").startswith("hermes_thinking_")
+        ]
+
+        # Insert thinking blocks after the main content (before any footer)
+        footer_idx = None
+        for i, b in enumerate(preserved):
+            if b.get("type") == "context":
+                footer_idx = i
+                break
+
+        if footer_idx is not None:
+            updated_blocks = preserved[:footer_idx] + new_blocks + preserved[footer_idx:]
+        else:
+            updated_blocks = preserved + new_blocks
+
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id,
+                ts=msg_ts,
+                text=message.get("text", ""),
+                blocks=updated_blocks[:MAX_BLOCKS_PER_MESSAGE],
+            )
+        except Exception as e:
+            logger.warning("[Slack] Failed to update thinking toggle message: %s", e)
+
+    # ----- Model selector support (Block Kit) -----
+
+    async def _handle_model_select_action(self, ack, body, action) -> None:
+        """Handle a model selector dropdown selection."""
+        await ack()
+
+        selected_option = action.get("selected_option", {})
+        selected_value = selected_option.get("value", "")
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        if not selected_value:
+            return
+
+        # Authorization
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                return
+
+        # The model value is the model identifier (e.g. "anthropic/claude-sonnet-4")
+        logger.info(
+            "[Slack] Model selector: user=%s model=%s",
+            user_name, selected_value,
+        )
+
+        # Post a confirmation ephemeral so the user knows the change is pending
+        try:
+            await self._get_client(channel_id).chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=f"🔄 Switching model to `{selected_value}` for next turn…",
+            )
+        except Exception:
+            pass
+
+        # Store the pending model switch — the gateway session watcher
+        # picks it up on the next turn.  For now, just log + ephemeral.
+        try:
+            # Extract block_id to find session_key
+            block_id = ""
+            for b in message.get("blocks", []):
+                if b.get("type") == "actions":
+                    block_id = b.get("block_id", "")
+                    break
+
+            session_key = block_id.replace("hermes_model_", "") if block_id else ""
+            if session_key:
+                logger.info(
+                    "[Slack] Model switch requested: session=%s model=%s user=%s",
+                    session_key, selected_value, user_name,
+                )
+        except Exception as exc:
+            logger.error("[Slack] Model select action failed: %s", exc)
+
+    # ----- Reasoning level support (Block Kit) -----
+
+    async def _handle_reasoning_select_action(self, ack, body, action) -> None:
+        """Handle a reasoning level dropdown selection."""
+        await ack()
+
+        selected_option = action.get("selected_option", {})
+        selected_value = selected_option.get("value", "")
+        message = body.get("message", {})
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        if not selected_value or not selected_value.startswith("reasoning:"):
+            return
+
+        reasoning_level = selected_value.split(":", 1)[1]
+
+        # Authorization
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                return
+
+        logger.info(
+            "[Slack] Reasoning selector: user=%s level=%s",
+            user_name, reasoning_level,
+        )
+
+        try:
+            await self._get_client(channel_id).chat_postEphemeral(
+                channel=channel_id,
+                user=user_id,
+                text=f"🧠 Reasoning effort set to *{reasoning_level.title()}* for next turn.",
+            )
+        except Exception:
+            pass
+
+        # Extract session_key from block_id
+        block_id = ""
+        for b in message.get("blocks", []):
+            if b.get("type") == "actions":
+                block_id = b.get("block_id", "")
+                break
+
+        session_key = block_id.replace("hermes_reasoning_", "") if block_id else ""
+        if session_key:
+            logger.info(
+                "[Slack] Reasoning change requested: session=%s level=%s user=%s",
+                session_key, reasoning_level, user_name,
+            )
 
     # ----- Thread context fetching -----
 

@@ -3804,6 +3804,7 @@ class GatewayRunner:
                     "on_session_finalize",
                     session_id=getattr(agent, "session_id", None),
                     platform="gateway",
+                    reason="shutdown",
                 )
             except Exception:
                 pass
@@ -5036,6 +5037,7 @@ class GatewayRunner:
                                 "on_session_finalize",
                                 session_id=entry.session_id,
                                 platform=_platform,
+                                reason="session_expired",
                             )
                         except Exception:
                             pass
@@ -9995,12 +9997,19 @@ class GatewayRunner:
         # previous conversation must not survive the reset.
         self._clear_session_boundary_security_state(session_key)
 
+        _old_sid = old_entry.session_id if old_entry else None
+
         # Fire plugin on_session_finalize hook (session boundary)
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
-            _old_sid = old_entry.session_id if old_entry else None
-            _invoke_hook("on_session_finalize", session_id=_old_sid,
-                         platform=source.platform.value if source.platform else "")
+            _invoke_hook(
+                "on_session_finalize",
+                session_id=_old_sid,
+                platform=source.platform.value if source.platform else "",
+                reason="new_session",
+                old_session_id=_old_sid,
+                new_session_id=new_entry.session_id if new_entry else None,
+            )
         except Exception:
             pass
 
@@ -10069,8 +10078,14 @@ class GatewayRunner:
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _new_sid = new_entry.session_id if new_entry else None
-            _invoke_hook("on_session_reset", session_id=_new_sid,
-                         platform=source.platform.value if source.platform else "")
+            _invoke_hook(
+                "on_session_reset",
+                session_id=_new_sid,
+                platform=source.platform.value if source.platform else "",
+                reason="new_session",
+                old_session_id=_old_sid,
+                new_session_id=_new_sid,
+            )
         except Exception:
             pass
 
@@ -16732,6 +16747,13 @@ class GatewayRunner:
             # Finalize stream consumer
             if _stream_consumer:
                 _stream_consumer.finish()
+                # Pass captured thinking content to the adapter so it can
+                # include a Block Kit thinking toggle in the response.
+                _store_fn = getattr(_adapter, "store_thinking_content", None)
+                if _store_fn and callable(_store_fn):
+                    _thinking = _stream_consumer.thinking_content
+                    if _thinking:
+                        _store_fn(source.chat_id, _thinking, session_key or "")
             if stream_task:
                 try:
                     await asyncio.wait_for(stream_task, timeout=5.0)
@@ -18120,6 +18142,18 @@ class GatewayRunner:
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
                 _stream_consumer.finish()
+                # Pass captured thinking content to the adapter so it can
+                # include a Block Kit thinking toggle in the response.
+                try:
+                    _local_adapter = _adapter  # type: ignore[possibly-undefined]
+                    if _local_adapter is not None:
+                        _store_fn2 = getattr(_local_adapter, "store_thinking_content", None)
+                        if _store_fn2 and callable(_store_fn2):
+                            _thinking2 = _stream_consumer.thinking_content
+                            if _thinking2:
+                                _store_fn2(source.chat_id, _thinking2, session_key or "")
+                except NameError:
+                    pass
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")

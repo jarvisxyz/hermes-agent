@@ -168,6 +168,11 @@ class GatewayStreamConsumer:
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
         self._think_buffer = ""
+        # Accumulated thinking/reasoning content (captured from inside
+        # <think>/<thinking> tags rather than discarded).  Available via
+        # the ``thinking_content`` property so platform adapters can attach
+        # it to messages (e.g. Slack Block Kit thinking toggle).
+        self._thinking_content = ""
 
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
@@ -203,6 +208,13 @@ class GatewayStreamConsumer:
         """True when the final response content reached the user, even if
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
+
+    @property
+    def thinking_content(self) -> str:
+        """The reasoning/thinking content captured from inside
+         wave/<thinking> tags during the stream.  Empty string
+        when no thinking blocks were present."""
+        return self._thinking_content
 
     async def _edit_message(
         self,
@@ -325,13 +337,16 @@ class GatewayStreamConsumer:
                         best_len = len(tag)
 
                 if best_len:
-                    # Found closing tag — discard block, process remainder
+                    # Found closing tag — capture thinking content, process remainder
+                    self._thinking_content += buf[:best_idx]
                     self._in_think_block = False
                     buf = buf[best_idx + best_len:]
                 else:
                     # No closing tag yet — hold tail that could be a
-                    # partial closing tag prefix, discard the rest.
+                    # partial closing tag prefix, capture the rest as thinking.
                     max_tag = max(len(t) for t in self._CLOSE_THINK_TAGS)
+                    safe_len = max(len(buf) - max_tag, 0)
+                    self._thinking_content += buf[:safe_len]
                     self._think_buffer = buf[-max_tag:] if len(buf) > max_tag else buf
                     return
             else:

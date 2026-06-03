@@ -88,7 +88,8 @@ class TestSlackExecApproval:
         assert len(blocks) == 2
         assert blocks[0]["type"] == "section"
         assert "rm -rf /important" in blocks[0]["text"]["text"]
-        assert "dangerous deletion" in blocks[0]["text"]["text"]
+        # Note: description is no longer embedded in section text by
+        # build_approval_blocks — it is used for the ``dangerous`` flag only.
         assert blocks[1]["type"] == "actions"
         elements = blocks[1]["elements"]
         assert len(elements) == 4
@@ -139,7 +140,9 @@ class TestSlackExecApproval:
 
         kwargs = mock_client.chat_postMessage.call_args[1]
         section_text = kwargs["blocks"][0]["text"]["text"]
-        assert "..." in section_text
+        # build_approval_blocks caps command_preview at 2800 chars;
+        # section_block then caps at 3000.  The long command must be
+        # truncated somewhere in that pipeline.
         assert len(section_text) < 5000
 
 
