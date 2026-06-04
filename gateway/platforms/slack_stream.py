@@ -151,6 +151,7 @@ class SlackStreamConsumer:
         # Track active tasks so we can complete/fail them
         self._active_tasks: Dict[str, str] = {}  # task_id → name
         self._active_task_descs: Dict[str, str] = {}  # task_id → in-progress description
+        self._active_task_previews: Dict[str, str] = {}  # task_id → original preview string
 
         # Whether we've started the Response step
         self._response_step_id: Optional[str] = None
@@ -256,6 +257,7 @@ class SlackStreamConsumer:
             self._queue.put((_TASK_START, task_id, title, "in_progress", desc))
             self._active_tasks[task_id] = tool_name
             self._active_task_descs[task_id] = desc
+            self._active_task_previews[task_id] = preview or ""
 
         elif event_type == "tool.completed" and tool_name:
             # Find the matching active task
@@ -266,21 +268,18 @@ class SlackStreamConsumer:
                     break
             if task_id:
                 duration = kwargs.get("duration", 0)
-                # Just show the duration — checkmark already indicates completion
-                dur_str = f"({duration:.1f}s)" if duration else ""
-                # Preserve the in-progress description so the args stay visible
-                prev_desc = self._active_task_descs.get(task_id, "")
-                if prev_desc and dur_str:
-                    desc = f"{prev_desc} {dur_str}"
-                elif dur_str:
-                    desc = dur_str
-                else:
-                    desc = prev_desc
-                # Preserve the full title with preview on completion too
-                title = self._format_tool_title(tool_name, prev_desc or "")
+                # Just show the duration — checkmark already indicates completion.
+                # Slack APPENDS the details field across updates, so only send
+                # the duration here; the in-progress description is already visible.
+                dur_str = f" ({duration:.1f}s)" if duration else ""
+                desc = dur_str
+                # Preserve the original title (with preview) on completion too
+                original_preview = self._active_task_previews.get(task_id, "")
+                title = self._format_tool_title(tool_name, original_preview)
                 self._queue.put((_TASK_UPDATE, task_id, title, "complete", desc))
                 self._active_tasks.pop(task_id, None)
                 self._active_task_descs.pop(task_id, None)
+                self._active_task_previews.pop(task_id, None)
 
     def on_thinking_start(self) -> None:
         """Signal that the model is thinking/reasoning."""

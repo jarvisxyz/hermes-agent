@@ -111,9 +111,8 @@ class TestOnToolProgress:
         item = consumer._queue.get_nowait()
         assert item[0] is _TASK_UPDATE
         assert item[3] == "complete"
-        # Description shows just the duration — no redundant "Done"
-        assert "Done" not in item[4]
-        assert "2.5s" in item[4]
+        # Description is just the duration (Slack appends to in-progress details)
+        assert item[4] == " (2.5s)"
 
     def test_ignores_unknown_event(self, consumer):
         consumer.on_tool_progress("tool.unknown", tool_name="foo")
@@ -315,7 +314,7 @@ class TestTaskIdTracking:
         assert update_item[1] == task_id
 
     def test_completed_preserves_description(self, consumer):
-        """Completed tool step preserves in-progress description + shows duration."""
+        """Completed tool step appends duration to in-progress details (Slack appends)."""
         consumer.on_tool_progress(
             "tool.started", tool_name="terminal", args={"command": "ls -la"},
         )
@@ -324,28 +323,38 @@ class TestTaskIdTracking:
             "tool.completed", tool_name="terminal", duration=1.2,
         )
         item = consumer._queue.get_nowait()
-        # Description should contain the original args and duration — no "Done"
-        assert "command" in item[4]
-        assert "1.2s" in item[4]
+        # Description is just the duration — Slack appends to the start details
+        # so the rendered result is "command: ls -la (1.2s)"
+        assert item[4] == " (1.2s)"
         assert "Done" not in item[4]
-        # Description should have a space separating args from duration
-        assert "1.2s" in item[4]
-        # Space separator (not newline — Slack step details don't render newlines well)
-        assert item[4].endswith("(1.2s)")
-        assert "command: ls -la (1.2s)" in item[4]
 
     def test_completed_preserves_title_with_args(self, consumer):
-        """Completed step title includes the args preview, not just tool name."""
+        """Completed step title uses original preview, not raw args key:value."""
         consumer.on_tool_progress(
-            "tool.started", tool_name="terminal", args={"command": "gh pr view 9"},
+            "tool.started", tool_name="terminal",
+            preview="gh pr view 9",
+            args={"command": "gh pr view 9"},
         )
         consumer._queue.get_nowait()  # consume start
         consumer.on_tool_progress(
             "tool.completed", tool_name="terminal", duration=0.8,
         )
         item = consumer._queue.get_nowait()
-        # Title should preserve the command, not revert to just "Terminal"
-        assert "gh pr view 9" in item[2]
+        # Title should use the original preview, not the raw args description
+        assert item[2] == "Terminal: gh pr view 9"
+
+    def test_completed_title_without_preview(self, consumer):
+        """When no preview, completed title falls back to tool display name."""
+        consumer.on_tool_progress(
+            "tool.started", tool_name="terminal", args={"command": "ls"},
+        )
+        consumer._queue.get_nowait()  # consume start
+        consumer.on_tool_progress(
+            "tool.completed", tool_name="terminal", duration=0.5,
+        )
+        item = consumer._queue.get_nowait()
+        # Title uses args desc as preview since no explicit preview was given
+        assert "Terminal" in item[2]
 
 
 class TestMakeTaskChunk:
