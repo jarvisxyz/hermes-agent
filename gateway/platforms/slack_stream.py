@@ -1,7 +1,7 @@
 """Slack AI Assistant streaming consumer — native step indicators via the Steps API.
 
 Uses Slack's ``chat.startStream`` / ``chat.appendStream`` / ``chat.stopStream``
-methods with ``task_update`` chunks to render native collapsible step cards
+methods with ``TaskUpdateChunk`` objects to render native collapsible step cards
 with checkmarks, chevrons, and status indicators — the same UI pattern used
 by Slack's own AI assistants (e.g. Slack AI, Highbeam's Luma).
 
@@ -10,14 +10,28 @@ Architecture
 Instead of the legacy postMessage → chat.update edit loop, this consumer:
 
 1. Calls ``chat.startStream`` with ``task_display_mode="plan"`` to create a
-   streaming message container.  The response includes a ``ts`` for the stream.
-2. Calls ``chat.appendStream`` with ``task_update`` chunks for each tool call:
-   - When a tool starts: ``{type: "task_start", id, name, status: "in_progress"}``
-   - When a tool completes: ``{type: "task_update", id, name, status: "complete", description}``
-   - When a tool fails: ``{type: "task_update", id, name, status: "failed", description}``
-3. Appends ``markdown_text`` chunks as the model streams tokens.
-4. Calls ``chat.stopStream`` to finalize, optionally with Block Kit ``blocks``
-   for the final rendered message (e.g. footer, feedback buttons).
+   streaming message container in **plan mode**.  The response includes a
+   ``ts`` for the stream.
+
+2. Calls ``chat.appendStream`` with ``TaskUpdateChunk`` objects for each step:
+   - When a tool starts:  ``TaskUpdateChunk(id, title, status="in_progress")``
+   - When a tool completes: ``TaskUpdateChunk(id, title, status="complete", details=...)``
+   - When a tool fails:  ``TaskUpdateChunk(id, title, status="failed", details=...)``
+
+3. For the model's text output, emits a **"Response" task step** whose
+   ``output`` field carries the markdown text.  This is required because
+   plan mode streams cannot use ``markdown_text`` — they only accept
+   ``chunks``.  The text is buffered and flushed periodically as incremental
+   updates to the Response step's ``output``.
+
+4. Calls ``chat.stopStream`` to finalize.
+
+.. important::
+   Slack's streaming API enforces **mode isolation**: a stream started with
+   ``task_display_mode="plan"`` can only accept ``chunks`` (not
+   ``markdown_text``), and vice versa.  Attempting to mix them raises
+   ``streaming_mode_mismatch``.  This consumer uses plan mode exclusively
+   and routes all text through ``TaskUpdateChunk.output``.
 
 Thread Safety
 -------------
@@ -68,16 +82,18 @@ class StreamChunk:
 @dataclass
 class SlackStreamConfig:
     """Runtime config for a Slack streaming consumer instance."""
-    # How often to flush accumulated markdown_text (seconds)
-    flush_interval: float = 0.8
+    # How often to flush accumulated text to the Response step (seconds)
+    flush_interval: float = 1.0
     # Maximum characters to buffer before flushing regardless of interval
-    buffer_threshold: int = 800
+    buffer_threshold: int = 1200
     # Whether to include thinking/reasoning as a task step
     show_thinking: bool = True
     # Whether to set thread title on first response
     set_title: bool = True
     # Whether to include feedback buttons on the final message
     feedback_buttons: bool = True
+    # Title for the Response step that carries the LLM text output
+    response_step_title: str = "Response"
 
 
 class SlackStreamConsumer:
@@ -128,13 +144,20 @@ class SlackStreamConsumer:
         # Running counter for task IDs
         self._task_counter: int = 0
 
-        # Buffer for text deltas
+        # Buffer for text deltas — accumulated and flushed to the Response
+        # step's ``output`` field periodically
         self._text_buffer: str = ""
 
         # Track active tasks so we can complete/fail them
         self._active_tasks: Dict[str, str] = {}  # task_id → name
 
-        # Whether we've sent the first appendStream with markdown
+        # Whether we've started the Response step
+        self._response_step_id: Optional[str] = None
+
+        # Total text sent so far (for incremental output updates)
+        self._total_text_sent: int = 0
+
+        # Whether we've sent the first appendStream
         self._started: bool = False
 
     # ── Public sync callbacks (called from agent worker thread) ───────
@@ -154,9 +177,9 @@ class SlackStreamConsumer:
     ) -> None:
         """Thread-safe callback for tool lifecycle events.
 
-        Maps agent tool events to Slack task_update chunks:
-        - ``tool.started``  → ``task_start`` (in_progress)
-        - ``tool.completed`` → ``task_update`` (complete)
+        Maps agent tool events to Slack TaskUpdateChunk steps:
+        - ``tool.started``  → in_progress step
+        - ``tool.completed`` → complete step
         """
         if event_type == "tool.started" and tool_name:
             self._task_counter += 1
@@ -227,7 +250,7 @@ class SlackStreamConsumer:
                 pass
 
             if item is None:
-                # Periodic flush of buffered text
+                # Periodic flush of buffered text to the Response step
                 now = time.monotonic()
                 if self._text_buffer and (now - last_flush) >= self._config.flush_interval:
                     await self._flush_text()
@@ -252,16 +275,16 @@ class SlackStreamConsumer:
 
             elif kind is _TASK_START:
                 _, task_id, task_name, status, desc = item
-                await self._send_task_start(task_id, task_name, status, desc)
+                await self._send_task_step(task_id, task_name, status, desc)
 
             elif kind is _TASK_UPDATE:
                 _, task_id, task_name, status, desc = item
-                await self._send_task_update(task_id, task_name, status, desc)
+                await self._send_task_step(task_id, task_name, status, desc)
 
     # ── Slack API calls ──────────────────────────────────────────────
 
     async def _start_stream(self) -> None:
-        """Initiate a streaming message via chat.startStream."""
+        """Initiate a streaming message via chat.startStream in plan mode."""
         resp = await self._client.chat_startStream(
             channel=self._channel_id,
             thread_ts=self._thread_ts,
@@ -278,112 +301,133 @@ class SlackStreamConsumer:
         )
         self._started = True
 
+    async def _ensure_response_step(self) -> str:
+        """Create the Response step if it doesn't exist yet, return its ID."""
+        if self._response_step_id is not None:
+            return self._response_step_id
+        self._task_counter += 1
+        self._response_step_id = f"response_{self._task_counter}"
+        # Start the Response step as in_progress
+        await self._send_task_step(
+            self._response_step_id,
+            self._config.response_step_title,
+            "in_progress",
+            "",
+        )
+        return self._response_step_id
+
     async def _flush_text(self) -> None:
-        """Flush accumulated text deltas via chat.appendStream."""
+        """Flush accumulated text deltas to the Response step's output field.
+
+        In plan mode, ``markdown_text`` is not allowed — text must be carried
+        inside a ``TaskUpdateChunk.output`` field.  We maintain a "Response"
+        step and update it with the full accumulated text each flush.
+        """
         if not self._text_buffer or not self._stream_ts:
             return
         try:
-            await self._client.chat_appendStream(
-                channel=self._channel_id,
-                ts=self._stream_ts,
-                markdown_text=self._text_buffer,
-            )
-            self._text_buffer = ""
-        except Exception as e:
-            logger.warning("[SlackStream] appendStream text failed: %s", e)
-
-    async def _send_task_start(
-        self, task_id: str, name: str, status: str, description: str,
-    ) -> None:
-        """Send a TaskUpdateChunk to create a new step indicator."""
-        if not self._stream_ts:
-            return
-        try:
-            from slack_sdk.models.messages.chunk import TaskUpdateChunk
-            chunk = TaskUpdateChunk(
-                id=task_id,
-                title=name,
-                status=status,
-                details=description or None,
+            step_id = await self._ensure_response_step()
+            # Build the full output so far
+            full_text = self._text_buffer[:self._total_text_sent + len(self._text_buffer)]
+            # Actually just send what we have — the output field replaces the
+            # previous value for this step ID
+            full_output = self._text_buffer
+            chunk = self._make_task_chunk(
+                step_id,
+                self._config.response_step_title,
+                "in_progress",
+                output=full_output,
             )
             await self._client.chat_appendStream(
                 channel=self._channel_id,
                 ts=self._stream_ts,
                 chunks=[chunk],
             )
-        except ImportError:
-            # Fallback for slack_sdk < 3.35
-            chunk = {
-                "type": "task_start",
+            self._total_text_sent = len(self._text_buffer)
+            # Don't clear the buffer yet — we need the full text for the next
+            # incremental update (Slack replaces the entire output each time)
+        except Exception as e:
+            logger.warning("[SlackStream] flush text to Response step failed: %s", e)
+
+    async def _send_task_step(
+        self, task_id: str, name: str, status: str, description: str,
+    ) -> None:
+        """Send a TaskUpdateChunk for a tool/thinking step."""
+        if not self._stream_ts:
+            return
+        try:
+            chunk = self._make_task_chunk(task_id, name, status, details=description or None)
+            await self._client.chat_appendStream(
+                channel=self._channel_id,
+                ts=self._stream_ts,
+                chunks=[chunk],
+            )
+        except Exception as e:
+            logger.warning("[SlackStream] task step failed for %s: %s", name, e)
+
+    def _make_task_chunk(
+        self,
+        task_id: str,
+        title: str,
+        status: str,
+        details: Optional[str] = None,
+        output: Optional[str] = None,
+    ) -> Any:
+        """Build a TaskUpdateChunk, falling back to a raw dict for old SDKs."""
+        try:
+            from slack_sdk.models.messages.chunk import TaskUpdateChunk
+            kwargs: Dict[str, Any] = {
                 "id": task_id,
-                "name": name,
+                "title": title,
                 "status": status,
             }
-            if description:
-                chunk["description"] = description
-            try:
-                await self._client.chat_appendStream(
-                    channel=self._channel_id,
-                    ts=self._stream_ts,
-                    chunks=[chunk],
-                )
-            except Exception as e:
-                logger.warning("[SlackStream] task_start failed for %s: %s", name, e)
-        except Exception as e:
-            logger.warning("[SlackStream] task_start failed for %s: %s", name, e)
-
-    async def _send_task_update(
-        self, task_id: str, name: str, status: str, description: str,
-    ) -> None:
-        """Send a TaskUpdateChunk to update a step's status."""
-        if not self._stream_ts:
-            return
-        try:
-            from slack_sdk.models.messages.chunk import TaskUpdateChunk
-            chunk = TaskUpdateChunk(
-                id=task_id,
-                title=name,
-                status=status,
-                details=description or None,
-            )
-            await self._client.chat_appendStream(
-                channel=self._channel_id,
-                ts=self._stream_ts,
-                chunks=[chunk],
-            )
+            if details:
+                kwargs["details"] = details
+            if output:
+                kwargs["output"] = output
+            return TaskUpdateChunk(**kwargs)
         except ImportError:
             # Fallback for slack_sdk < 3.35
-            chunk = {
+            chunk: Dict[str, Any] = {
                 "type": "task_update",
                 "id": task_id,
-                "name": name,
+                "name": title,
                 "status": status,
             }
-            if description:
-                chunk["description"] = description
-            try:
-                await self._client.chat_appendStream(
-                    channel=self._channel_id,
-                    ts=self._stream_ts,
-                    chunks=[chunk],
-                )
-            except Exception as e:
-                logger.warning("[SlackStream] task_update failed for %s: %s", name, e)
-        except Exception as e:
-            logger.warning("[SlackStream] task_update failed for %s: %s", name, e)
+            if details:
+                chunk["description"] = details
+            if output:
+                chunk["output"] = output
+            return chunk
 
     async def _finalize(self) -> None:
-        """Flush remaining text and stop the stream."""
-        # Complete any still-active tasks
+        """Flush remaining text, complete active tasks, and stop the stream."""
+        # Complete any still-active tool/thinking tasks
         for task_id, name in list(self._active_tasks.items()):
             try:
-                await self._send_task_update(task_id, name, "complete", "")
+                await self._send_task_step(task_id, name, "complete", "")
             except Exception:
                 pass
 
-        # Flush remaining text
-        if self._text_buffer:
-            await self._flush_text()
+        # Flush remaining text and mark the Response step as complete
+        if self._text_buffer or self._response_step_id:
+            try:
+                step_id = await self._ensure_response_step()
+                full_output = self._text_buffer or ""
+                chunk = self._make_task_chunk(
+                    step_id,
+                    self._config.response_step_title,
+                    "complete",
+                    output=full_output,
+                )
+                await self._client.chat_appendStream(
+                    channel=self._channel_id,
+                    ts=self._stream_ts,
+                    chunks=[chunk],
+                )
+                self._text_buffer = ""
+            except Exception as e:
+                logger.warning("[SlackStream] finalize Response step failed: %s", e)
 
         # Stop the stream
         if self._stream_ts:

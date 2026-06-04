@@ -42,6 +42,7 @@ class TestSlackStreamConsumerInit:
         assert c._thread_ts == "123.456"
         assert c._stream_ts is None
         assert c._started is False
+        assert c._response_step_id is None
 
     def test_custom_config(self, mock_client):
         cfg = SlackStreamConfig(show_thinking=False, feedback_buttons=False)
@@ -138,28 +139,29 @@ class TestFinish:
 class TestRunLifecycle:
     @pytest.mark.asyncio
     async def test_full_lifecycle(self, consumer, mock_client):
-        """Test the full stream lifecycle: start → deltas → tasks → stop."""
+        """Test the full stream lifecycle: start → thinking → tools → text → stop."""
         # Start the run in background
         run_task = asyncio.create_task(consumer.run())
         # Give it a moment to call startStream
         await asyncio.sleep(0.05)
 
         # Simulate agent activity
-        consumer.on_delta("Hello ")
-        consumer.on_delta("world!")
+        consumer.on_thinking_start()
+        await asyncio.sleep(0.05)
+        consumer.on_thinking_end()
         await asyncio.sleep(0.05)
         consumer.on_tool_progress("tool.started", tool_name="web_search", preview="test query")
         await asyncio.sleep(0.05)
         consumer.on_tool_progress("tool.completed", tool_name="web_search", duration=1.0)
         await asyncio.sleep(0.05)
-        consumer.on_delta(" Here are the results.")
-        await asyncio.sleep(0.1)
+        consumer.on_delta("Hello! Here are the results.")
+        await asyncio.sleep(0.15)
         consumer.finish()
 
         # Wait for run to complete
         await asyncio.wait_for(run_task, timeout=5.0)
 
-        # Verify startStream was called
+        # Verify startStream was called with plan mode
         mock_client.chat_startStream.assert_called_once_with(
             channel="C0TEST",
             thread_ts="1234567890.000001",
@@ -172,8 +174,8 @@ class TestRunLifecycle:
             ts="1234567890.123456",
         )
 
-        # Verify appendStream was called for text and chunks
-        assert mock_client.chat_appendStream.call_count >= 2  # at least text + task_start
+        # Verify appendStream was called for chunks (task steps + response step)
+        assert mock_client.chat_appendStream.call_count >= 3  # thinking + tool + response
 
     @pytest.mark.asyncio
     async def test_start_stream_failure(self, mock_client):
@@ -195,6 +197,29 @@ class TestRunLifecycle:
         consumer.finish()
         await asyncio.wait_for(run_task, timeout=5.0)
 
+    @pytest.mark.asyncio
+    async def test_text_creates_response_step(self, consumer, mock_client):
+        """Text deltas create and update a Response step in plan mode."""
+        run_task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.on_delta("Hello world!")
+        await asyncio.sleep(0.15)
+        consumer.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # Verify that at least one appendStream call used chunks (not markdown_text)
+        chunk_calls = [
+            call for call in mock_client.chat_appendStream.call_args_list
+            if call.kwargs.get("chunks")
+        ]
+        assert len(chunk_calls) >= 1
+        # No call should use markdown_text (plan mode forbids it)
+        md_calls = [
+            call for call in mock_client.chat_appendStream.call_args_list
+            if call.kwargs.get("markdown_text")
+        ]
+        assert len(md_calls) == 0
+
 
 class TestTaskIdTracking:
     def test_incrementing_task_ids(self, consumer):
@@ -214,10 +239,27 @@ class TestTaskIdTracking:
         assert update_item[1] == task_id
 
 
+class TestMakeTaskChunk:
+    def test_typed_chunk_with_sdk(self, consumer):
+        """When slack_sdk is available, _make_task_chunk returns TaskUpdateChunk."""
+        chunk = consumer._make_task_chunk("t1", "Web Search", "in_progress", details="query: test")
+        # Should be a TaskUpdateChunk if SDK is available
+        from slack_sdk.models.messages.chunk import TaskUpdateChunk
+        assert isinstance(chunk, TaskUpdateChunk)
+
+    def test_chunk_with_output(self, consumer):
+        """TaskUpdateChunk with output field for Response step text."""
+        chunk = consumer._make_task_chunk("r1", "Response", "complete", output="Hello world")
+        from slack_sdk.models.messages.chunk import TaskUpdateChunk
+        assert isinstance(chunk, TaskUpdateChunk)
+        # output field should be set
+        assert chunk.output == "Hello world"
+
+
 class TestFlushText:
     @pytest.mark.asyncio
     async def test_buffer_threshold_flush(self, mock_client):
-        """Text is flushed when buffer exceeds threshold."""
+        """Text is flushed to Response step when buffer exceeds threshold."""
         cfg = SlackStreamConfig(flush_interval=100, buffer_threshold=20)
         c = SlackStreamConsumer(mock_client, "C0", "123.456", config=cfg)
         # Simulate the run loop manually
@@ -226,20 +268,26 @@ class TestFlushText:
         # Let the run loop process it
         c.finish()
         await c.run()
-        # Verify appendStream was called with the text
-        text_calls = [
+        # Verify appendStream was called with chunks (not markdown_text)
+        chunk_calls = [
+            call for call in mock_client.chat_appendStream.call_args_list
+            if call.kwargs.get("chunks")
+        ]
+        assert len(chunk_calls) >= 1
+        # Verify no markdown_text calls (plan mode)
+        md_calls = [
             call for call in mock_client.chat_appendStream.call_args_list
             if call.kwargs.get("markdown_text")
         ]
-        assert len(text_calls) >= 1
-        assert "A" * 30 in text_calls[0].kwargs["markdown_text"]
+        assert len(md_calls) == 0
 
 
 class TestSlackStreamConfig:
     def test_defaults(self):
         cfg = SlackStreamConfig()
-        assert cfg.flush_interval == 0.8
-        assert cfg.buffer_threshold == 800
+        assert cfg.flush_interval == 1.0
+        assert cfg.buffer_threshold == 1200
         assert cfg.show_thinking is True
         assert cfg.set_title is True
         assert cfg.feedback_buttons is True
+        assert cfg.response_step_title == "Response"
