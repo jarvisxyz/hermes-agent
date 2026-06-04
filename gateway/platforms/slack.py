@@ -1244,6 +1244,104 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setStatus clear failed: %s", e)
 
+    # ── Assistant Steps API support ─────────────────────────────────────
+
+    async def set_thread_title(
+        self,
+        chat_id: str,
+        thread_ts: str,
+        title: str,
+    ) -> bool:
+        """Set the title of an assistant thread.
+
+        Uses ``assistant.threads.setTitle`` to give the thread a meaningful
+        name (e.g. "Research: quantum computing" or "Debug: auth flow").
+        Requires the ``assistant:write`` scope.
+
+        Returns True on success, False on failure (silently logged).
+        """
+        if not self._app:
+            return False
+        try:
+            await self._get_client(chat_id).assistant_threads_setTitle(
+                channel_id=chat_id,
+                thread_ts=thread_ts,
+                title=title,
+            )
+            return True
+        except Exception as e:
+            logger.debug("[Slack] assistant.threads.setTitle failed: %s", e)
+            return False
+
+    async def set_suggested_prompts(
+        self,
+        chat_id: str,
+        thread_ts: str,
+        prompts: List[Dict[str, str]],
+        title: Optional[str] = None,
+    ) -> bool:
+        """Set suggested follow-up prompts for an assistant thread.
+
+        Uses ``assistant.threads.setSuggestedPrompts`` to display clickable
+        prompt suggestions below the assistant's response.  Each prompt dict
+        should have ``"title"`` (display text) and ``"message"`` (what gets
+        sent when clicked).
+
+        Requires the ``assistant:write`` scope.
+
+        Returns True on success, False on failure (silently logged).
+        """
+        if not self._app:
+            return False
+        try:
+            kwargs: Dict[str, Any] = {
+                "channel_id": chat_id,
+                "thread_ts": thread_ts,
+                "prompts": prompts,
+            }
+            if title:
+                kwargs["title"] = title
+            await self._get_client(chat_id).assistant_threads_setSuggestedPrompts(
+                **kwargs,
+            )
+            return True
+        except Exception as e:
+            logger.debug("[Slack] assistant.threads.setSuggestedPrompts failed: %s", e)
+            return False
+
+    def create_stream_consumer(
+        self,
+        chat_id: str,
+        thread_ts: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> "SlackStreamConsumer":
+        """Create a :class:`SlackStreamConsumer` for native Slack streaming.
+
+        This is the entry point for the gateway to obtain a streaming consumer
+        that uses ``chat.startStream`` / ``chat.appendStream`` / ``chat.stopStream``
+        with ``task_update`` chunks instead of the legacy postMessage → edit loop.
+
+        The returned consumer's ``on_delta`` and ``on_tool_progress`` methods
+        can be wired directly as callbacks to ``AIAgent``.
+        """
+        from gateway.platforms.slack_stream import (
+            SlackStreamConsumer,
+            SlackStreamConfig,
+        )
+        client = self._get_client(chat_id)
+        config = SlackStreamConfig(
+            show_thinking=self.config.extra.get("show_thinking_steps", True),
+            set_title=self.config.extra.get("set_thread_title", True),
+            feedback_buttons=self.config.extra.get("feedback_buttons", True),
+        )
+        return SlackStreamConsumer(
+            client=client,
+            channel_id=chat_id,
+            thread_ts=thread_ts,
+            config=config,
+            metadata=metadata,
+        )
+
     def _dm_top_level_threads_as_sessions(self) -> bool:
         """Whether top-level Slack DMs get per-message session threads.
 

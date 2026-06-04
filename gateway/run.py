@@ -16739,40 +16739,68 @@ class GatewayRunner:
 
         if _streaming_enabled:
             try:
-                from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                 _adapter = self.adapters.get(source.platform)
                 if _adapter:
-                    _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                    _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
-                    _buffer_only = False
-                    if source.platform == Platform.MATRIX:
-                        _effective_cursor = ""
-                        _buffer_only = True
-                    # Fresh-final applies to Telegram only — other
-                    # platforms either edit in place cheaply (Discord,
-                    # Slack) or don't have the timestamp-on-edit
-                    # problem.  (Ported from openclaw/openclaw#72038.)
-                    _fresh_final_secs = (
-                        float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                        if source.platform == Platform.TELEGRAM
-                        else 0.0
-                    )
-                    _consumer_cfg = StreamConsumerConfig(
-                        edit_interval=_scfg.edit_interval,
-                        buffer_threshold=_scfg.buffer_threshold,
-                        cursor=_effective_cursor,
-                        buffer_only=_buffer_only,
-                        fresh_final_after_seconds=_fresh_final_secs,
-                        transport=_scfg.transport or "edit",
-                        chat_type=getattr(source, "chat_type", "") or "",
-                    )
-                    _stream_consumer = GatewayStreamConsumer(
-                        adapter=_adapter,
-                        chat_id=source.chat_id,
-                        config=_consumer_cfg,
-                        metadata=_thread_metadata,
-                        initial_reply_to_id=event_message_id,
-                    )
+                    # ── Slack native Steps API streaming ────────────────
+                    if source.platform == Platform.SLACK:
+                        _slack_thread_ts = (
+                            _thread_metadata.get("thread_id")
+                            if _thread_metadata
+                            else None
+                        ) or source.thread_id or event_message_id
+                        if _slack_thread_ts and hasattr(_adapter, "create_stream_consumer"):
+                            try:
+                                _stream_consumer = _adapter.create_stream_consumer(
+                                    chat_id=source.chat_id,
+                                    thread_ts=_slack_thread_ts,
+                                    metadata=_thread_metadata,
+                                )
+                                logger.debug(
+                                    "Proxy: Using Slack native Steps API streaming: "
+                                    "channel=%s thread=%s",
+                                    source.chat_id, _slack_thread_ts,
+                                )
+                            except Exception as _sse:
+                                logger.debug(
+                                    "Proxy: Slack native stream setup failed, "
+                                    "falling back to edit-based: %s", _sse,
+                                )
+                                _stream_consumer = None
+
+                    # ── Legacy edit-based streaming ─────────────────────
+                    if _stream_consumer is None:
+                        from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                        _effective_cursor = _scfg.cursor if _adapter_supports_edit else ""
+                        _buffer_only = False
+                        if source.platform == Platform.MATRIX:
+                            _effective_cursor = ""
+                            _buffer_only = True
+                        # Fresh-final applies to Telegram only — other
+                        # platforms either edit in place cheaply (Discord,
+                        # Slack) or don't have the timestamp-on-edit
+                        # problem.  (Ported from openclaw/openclaw#72038.)
+                        _fresh_final_secs = (
+                            float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
+                            if source.platform == Platform.TELEGRAM
+                            else 0.0
+                        )
+                        _consumer_cfg = StreamConsumerConfig(
+                            edit_interval=_scfg.edit_interval,
+                            buffer_threshold=_scfg.buffer_threshold,
+                            cursor=_effective_cursor,
+                            buffer_only=_buffer_only,
+                            fresh_final_after_seconds=_fresh_final_secs,
+                            transport=_scfg.transport or "edit",
+                            chat_type=getattr(source, "chat_type", "") or "",
+                        )
+                        _stream_consumer = GatewayStreamConsumer(
+                            adapter=_adapter,
+                            chat_id=source.chat_id,
+                            config=_consumer_cfg,
+                            metadata=_thread_metadata,
+                            initial_reply_to_id=event_message_id,
+                        )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
 
@@ -17730,62 +17758,102 @@ class GatewayRunner:
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
+            _use_slack_native_stream = False
             if _want_stream_deltas or _want_interim_consumer:
                 try:
-                    from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
-                        # Platforms that don't support editing sent messages
-                        # (e.g. QQ, WeChat) should skip streaming entirely —
-                        # without edit support, the consumer sends a partial
-                        # first message that can never be updated, resulting in
-                        # duplicate messages (partial + final).
-                        _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
-                        if not _adapter_supports_edit:
-                            raise RuntimeError("skip streaming for non-editable platform")
-                        _effective_cursor = _scfg.cursor
-                        # Some Matrix clients render the streaming cursor
-                        # as a visible tofu/white-box artifact.  Keep
-                        # streaming text on Matrix, but suppress the cursor.
-                        _buffer_only = False
-                        if source.platform == Platform.MATRIX:
-                            _effective_cursor = ""
-                            _buffer_only = True
-                        # Fresh-final applies to Telegram only — other
-                        # platforms either edit in place cheaply or don't
-                        # have the edit-timestamp-stays-stale problem.
-                        # (Ported from openclaw/openclaw#72038.)
-                        _fresh_final_secs = (
-                            float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
-                            if source.platform == Platform.TELEGRAM
-                            else 0.0
-                        )
-                        _consumer_cfg = StreamConsumerConfig(
-                            edit_interval=_scfg.edit_interval,
-                            buffer_threshold=_scfg.buffer_threshold,
-                            cursor=_effective_cursor,
-                            buffer_only=_buffer_only,
-                            fresh_final_after_seconds=_fresh_final_secs,
-                            transport=_scfg.transport or "edit",
-                            chat_type=getattr(source, "chat_type", "") or "",
-                        )
-                        _stream_consumer = GatewayStreamConsumer(
-                            adapter=_adapter,
-                            chat_id=source.chat_id,
-                            config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
-                            on_new_message=(
-                                (lambda: progress_queue.put(("__reset__",)))
-                                if progress_queue is not None
+                        # ── Slack native Steps API streaming ────────────
+                        # When running on Slack with a thread_ts, use
+                        # chat.startStream / appendStream / stopStream with
+                        # task_update chunks for native collapsible step
+                        # cards instead of the legacy postMessage → edit loop.
+                        if source.platform == Platform.SLACK:
+                            _slack_thread_ts = (
+                                _status_thread_metadata.get("thread_id")
+                                if _status_thread_metadata
                                 else None
-                            ),
-                            initial_reply_to_id=event_message_id,
-                        )
-                        if _want_stream_deltas:
-                            def _stream_delta_cb(text: str) -> None:
-                                if _run_still_current():
-                                    _stream_consumer.on_delta(text)
-                        stream_consumer_holder[0] = _stream_consumer
+                            ) or source.thread_id or event_message_id
+                            if _slack_thread_ts and hasattr(_adapter, "create_stream_consumer"):
+                                try:
+                                    _stream_consumer = _adapter.create_stream_consumer(
+                                        chat_id=source.chat_id,
+                                        thread_ts=_slack_thread_ts,
+                                        metadata=_status_thread_metadata,
+                                    )
+                                    _use_slack_native_stream = True
+                                    if _want_stream_deltas:
+                                        def _stream_delta_cb(text: str) -> None:
+                                            if _run_still_current():
+                                                _stream_consumer.on_delta(text)
+                                    stream_consumer_holder[0] = _stream_consumer
+                                    logger.debug(
+                                        "Using Slack native Steps API streaming: "
+                                        "channel=%s thread=%s",
+                                        source.chat_id, _slack_thread_ts,
+                                    )
+                                except Exception as _slack_stream_err:
+                                    logger.debug(
+                                        "Slack native stream setup failed, "
+                                        "falling back to edit-based streaming: %s",
+                                        _slack_stream_err,
+                                    )
+                                    _stream_consumer = None
+
+                        # ── Legacy edit-based streaming ─────────────────
+                        if not _use_slack_native_stream:
+                            from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+                            # Platforms that don't support editing sent messages
+                            # (e.g. QQ, WeChat) should skip streaming entirely —
+                            # without edit support, the consumer sends a partial
+                            # first message that can never be updated, resulting in
+                            # duplicate messages (partial + final).
+                            _adapter_supports_edit = getattr(_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+                            if not _adapter_supports_edit:
+                                raise RuntimeError("skip streaming for non-editable platform")
+                            _effective_cursor = _scfg.cursor
+                            # Some Matrix clients render the streaming cursor
+                            # as a visible tofu/white-box artifact.  Keep
+                            # streaming text on Matrix, but suppress the cursor.
+                            _buffer_only = False
+                            if source.platform == Platform.MATRIX:
+                                _effective_cursor = ""
+                                _buffer_only = True
+                            # Fresh-final applies to Telegram only — other
+                            # platforms either edit in place cheaply or don't
+                            # have the edit-timestamp-stays-stale problem.
+                            # (Ported from openclaw/openclaw#72038.)
+                            _fresh_final_secs = (
+                                float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
+                                if source.platform == Platform.TELEGRAM
+                                else 0.0
+                            )
+                            _consumer_cfg = StreamConsumerConfig(
+                                edit_interval=_scfg.edit_interval,
+                                buffer_threshold=_scfg.buffer_threshold,
+                                cursor=_effective_cursor,
+                                buffer_only=_buffer_only,
+                                fresh_final_after_seconds=_fresh_final_secs,
+                                transport=_scfg.transport or "edit",
+                                chat_type=getattr(source, "chat_type", "") or "",
+                            )
+                            _stream_consumer = GatewayStreamConsumer(
+                                adapter=_adapter,
+                                chat_id=source.chat_id,
+                                config=_consumer_cfg,
+                                metadata=_status_thread_metadata,
+                                on_new_message=(
+                                    (lambda: progress_queue.put(("__reset__",)))
+                                    if progress_queue is not None
+                                    else None
+                                ),
+                                initial_reply_to_id=event_message_id,
+                            )
+                            if _want_stream_deltas:
+                                def _stream_delta_cb(text: str) -> None:
+                                    if _run_still_current():
+                                        _stream_consumer.on_delta(text)
+                            stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
@@ -17885,7 +17953,13 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            # When using Slack native Steps API streaming, route tool progress
+            # through the SlackStreamConsumer's on_tool_progress (which emits
+            # task_start/task_update chunks) instead of the legacy text bubbles.
+            if _use_slack_native_stream and _stream_consumer is not None:
+                agent.tool_progress_callback = _stream_consumer.on_tool_progress if tool_progress_enabled else None
+            else:
+                agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (
