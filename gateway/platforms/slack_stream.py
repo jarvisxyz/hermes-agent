@@ -170,6 +170,38 @@ class SlackStreamConsumer:
         # message_not_in_streaming_state — prevents further API spam
         self._stream_broken: bool = False
 
+        # Whether the response was fully delivered (either via stream or
+        # fallback postMessage).  The gateway checks this to avoid duplicate
+        # sends.
+        self._final_content_delivered: bool = False
+
+    # ── Public properties ──────────────────────────────────────────────
+
+    @property
+    def stream_broken(self) -> bool:
+        """Whether the Slack stream was broken mid-delivery.
+
+        When True, the stream is no longer usable and any content that
+        was buffered but not flushed has been lost to the stream.  Callers
+        (e.g. the gateway) should fall back to ``chat.postMessage`` to
+        deliver the response.
+        """
+        return self._stream_broken
+
+    @property
+    def accumulated_text(self) -> str:
+        """All text received via ``on_delta``, including flushed portions."""
+        return self._text_buffer
+
+    @property
+    def final_content_delivered(self) -> bool:
+        """Whether the full response was successfully delivered to the user.
+
+        True when the stream completed normally or the fallback
+        ``chat.postMessage`` succeeded after a broken stream.
+        """
+        return self._final_content_delivered
+
     # ── Public sync callbacks (called from agent worker thread) ───────
 
     # Friendly display names for tool step titles.  Tools not listed here
@@ -556,11 +588,17 @@ class SlackStreamConsumer:
         Handles ``message_not_in_streaming_state`` gracefully — if Slack has
         already closed the stream (server-side timeout), we can't append any
         more chunks but the content already rendered is intact.
+
+        When the stream is broken, falls back to ``chat.postMessage`` to
+        deliver the accumulated text so the user isn't left staring at
+        Slack's "Something went wrong" step card with no content.
         """
         if self._stream_broken:
-            # Stream is already closed server-side — just try stopStream
-            # for cleanup and return.
+            # Stream is already closed server-side — try stopStream for
+            # cleanup, then fall back to chat.postMessage with any text
+            # we accumulated so the user still gets the content.
             await self._try_stop_stream()
+            await self._fallback_post_message()
             return
 
         _STREAM_CLOSED = "message_not_in_streaming_state"
@@ -608,6 +646,45 @@ class SlackStreamConsumer:
         await self._try_stop_stream()
 
         self._started = False
+        self._final_content_delivered = True
+
+    async def _fallback_post_message(self) -> None:
+        """Fall back to ``chat.postMessage`` when the stream is broken.
+
+        Delivers any accumulated text that wasn't flushed before the stream
+        died.  This ensures the user still gets the response content even
+        though the Slack Steps UI shows "Something went wrong" for the
+        incomplete step card.
+        """
+        text = self._text_buffer
+        if not text:
+            logger.debug("[SlackStream] No text to deliver via fallback postMessage")
+            return
+
+        try:
+            kwargs = {
+                "channel": self._channel_id,
+                "text": text,
+                "mrkdwn": True,
+            }
+            if self._thread_ts:
+                kwargs["thread_ts"] = self._thread_ts
+            result = await self._client.chat_postMessage(**kwargs)
+            ok = result.get("ok", True) if isinstance(result, dict) else getattr(result, "data", {}).get("ok", True)
+            if ok is not False:
+                logger.info(
+                    "[SlackStream] Delivered %d chars via fallback postMessage "
+                    "after broken stream (channel=%s thread=%s)",
+                    len(text), self._channel_id, self._thread_ts,
+                )
+                self._final_content_delivered = True
+            else:
+                error = result.get("error", "unknown") if isinstance(result, dict) else "unknown"
+                logger.warning("[SlackStream] Fallback postMessage failed: %s", error)
+        except Exception as e:
+            logger.warning(
+                "[SlackStream] Fallback postMessage failed: %s", e, exc_info=True,
+            )
 
     async def _try_stop_stream(self) -> None:
         """Best-effort call to chat.stopStream — safe even if stream is already closed."""
