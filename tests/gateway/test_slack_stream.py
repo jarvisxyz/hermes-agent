@@ -78,7 +78,7 @@ class TestOnToolProgress:
         # Title is now human-readable with preview
         assert item[2] == "Web search: query"
         assert item[3] == "in_progress"
-        # Description is built from args when no preview
+        # Description is built from args — empty here since no args dict provided
         assert item[4] == ""
 
     def test_tool_started_with_args(self, consumer):
@@ -89,6 +89,20 @@ class TestOnToolProgress:
         assert "Terminal" in item[2]
         assert "command" in item[4]
 
+    def test_tool_started_with_preview_and_args(self, consumer):
+        """When both preview and args are given, desc still gets args (not just title)."""
+        consumer.on_tool_progress(
+            "tool.started", tool_name="terminal", preview="ls -la",
+            args={"command": "ls -la"},
+        )
+        item = consumer._queue.get_nowait()
+        assert item[0] is _TASK_START
+        # Title uses preview
+        assert item[2] == "Terminal: ls -la"
+        # Desc is built from args even though preview exists
+        assert "command" in item[4]
+        assert "ls -la" in item[4]
+
     def test_tool_completed(self, consumer):
         # Start then complete
         consumer.on_tool_progress("tool.started", tool_name="web_search")
@@ -96,10 +110,9 @@ class TestOnToolProgress:
         consumer.on_tool_progress("tool.completed", tool_name="web_search", duration=2.5)
         item = consumer._queue.get_nowait()
         assert item[0] is _TASK_UPDATE
-        assert item[2] == "Web search"  # formatted title
         assert item[3] == "complete"
-        # Description includes completion status with duration
-        assert "Done" in item[4]
+        # Description shows just the duration — no redundant "Done"
+        assert "Done" not in item[4]
         assert "2.5s" in item[4]
 
     def test_ignores_unknown_event(self, consumer):
@@ -302,7 +315,7 @@ class TestTaskIdTracking:
         assert update_item[1] == task_id
 
     def test_completed_preserves_description(self, consumer):
-        """Completed tool step preserves in-progress description before 'Done'."""
+        """Completed tool step preserves in-progress description + shows duration."""
         consumer.on_tool_progress(
             "tool.started", tool_name="terminal", args={"command": "ls -la"},
         )
@@ -311,12 +324,25 @@ class TestTaskIdTracking:
             "tool.completed", tool_name="terminal", duration=1.2,
         )
         item = consumer._queue.get_nowait()
-        # Description should contain both the original args and the completion
+        # Description should contain the original args and duration — no "Done"
         assert "command" in item[4]
-        assert "Done" in item[4]
         assert "1.2s" in item[4]
-        # The description should have a newline separating them
+        assert "Done" not in item[4]
+        # The description should have a newline separating args from duration
         assert "\n" in item[4]
+
+    def test_completed_preserves_title_with_args(self, consumer):
+        """Completed step title includes the args preview, not just tool name."""
+        consumer.on_tool_progress(
+            "tool.started", tool_name="terminal", args={"command": "gh pr view 9"},
+        )
+        consumer._queue.get_nowait()  # consume start
+        consumer.on_tool_progress(
+            "tool.completed", tool_name="terminal", duration=0.8,
+        )
+        item = consumer._queue.get_nowait()
+        # Title should preserve the command, not revert to just "Terminal"
+        assert "gh pr view 9" in item[2]
 
 
 class TestMakeTaskChunk:

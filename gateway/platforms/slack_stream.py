@@ -243,9 +243,10 @@ class SlackStreamConsumer:
         if event_type == "tool.started" and tool_name:
             self._task_counter += 1
             task_id = f"tool_{self._task_counter}"
-            # Build the description from args if no preview
+            # Build the description from args — always, even when preview exists.
+            # Preview goes in the title; desc (subtitle) shows args for context.
             desc = ""
-            if not preview and args:
+            if args:
                 first_key = next(iter(args), None)
                 if first_key:
                     val = str(args[first_key])[:80]
@@ -265,14 +266,18 @@ class SlackStreamConsumer:
                     break
             if task_id:
                 duration = kwargs.get("duration", 0)
-                dur_str = f" ({duration:.1f}s)" if duration else ""
-                # Preserve the in-progress details and append completion status
+                # Just show the duration — checkmark already indicates completion
+                dur_str = f"({duration:.1f}s)" if duration else ""
+                # Preserve the in-progress description so the args stay visible
                 prev_desc = self._active_task_descs.get(task_id, "")
-                if prev_desc:
-                    desc = f"{prev_desc}\nDone{dur_str}"
+                if prev_desc and dur_str:
+                    desc = f"{prev_desc}\n{dur_str}"
+                elif dur_str:
+                    desc = dur_str
                 else:
-                    desc = f"Done{dur_str}"
-                title = self._format_tool_title(tool_name)
+                    desc = prev_desc
+                # Preserve the full title with preview on completion too
+                title = self._format_tool_title(tool_name, prev_desc or "")
                 self._queue.put((_TASK_UPDATE, task_id, title, "complete", desc))
                 self._active_tasks.pop(task_id, None)
                 self._active_task_descs.pop(task_id, None)
