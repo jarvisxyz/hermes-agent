@@ -271,7 +271,7 @@ class SlackStreamConsumer:
                 # Preserve the in-progress description so the args stay visible
                 prev_desc = self._active_task_descs.get(task_id, "")
                 if prev_desc and dur_str:
-                    desc = f"{prev_desc}\n{dur_str}"
+                    desc = f"{prev_desc} {dur_str}"
                 elif dur_str:
                     desc = dur_str
                 else:

@@ -328,8 +328,11 @@ class TestTaskIdTracking:
         assert "command" in item[4]
         assert "1.2s" in item[4]
         assert "Done" not in item[4]
-        # The description should have a newline separating args from duration
-        assert "\n" in item[4]
+        # Description should have a space separating args from duration
+        assert "1.2s" in item[4]
+        # Space separator (not newline — Slack step details don't render newlines well)
+        assert item[4].endswith("(1.2s)")
+        assert "command: ls -la (1.2s)" in item[4]
 
     def test_completed_preserves_title_with_args(self, consumer):
         """Completed step title includes the args preview, not just tool name."""
