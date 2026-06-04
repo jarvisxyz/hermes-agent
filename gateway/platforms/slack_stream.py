@@ -61,6 +61,33 @@ logger = logging.getLogger("gateway.slack_stream")
 
 # ── Queue sentinels ──────────────────────────────────────────────────────
 
+# Slack API error code returned when chat.appendStream / chat.stopStream
+# is called on a stream that has already been closed server-side (e.g. due
+# to timeout).  This is the *API error code* in the response body, NOT the
+# exception message — slack_sdk.errors.SlackApiError.__str__() does NOT
+# reliably include this code, so we must inspect e.response.data["error"].
+_STREAM_CLOSED_ERROR = "message_not_in_streaming_state"
+
+
+def _is_stream_closed_error(exc: Exception) -> bool:
+    """Check whether *exc* is a Slack ``message_not_in_streaming_state`` error.
+
+    The Slack SDK raises ``SlackApiError`` whose ``str()`` typically looks
+    like ``"The request to the Slack API failed. (url: …, status: 200)"``
+    — the actual error code lives in ``exc.response.data["error"]``.
+    We check both locations for robustness across SDK versions.
+    """
+    err_str = str(exc)
+    if _STREAM_CLOSED_ERROR in err_str:
+        return True
+    # Inspect the Slack response object directly
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        data = getattr(resp, "data", None) or {}
+        if isinstance(data, dict) and data.get("error") == _STREAM_CLOSED_ERROR:
+            return True
+    return False
+
 _DONE = object()        # Stream is complete
 _DELTA = object()       # Text delta from the model
 _TASK_START = object()  # Tool started
@@ -523,7 +550,7 @@ class SlackStreamConsumer:
             # Don't clear the buffer — we need the full text to compute
             # the delta for the next flush.
         except Exception as e:
-            if "message_not_in_streaming_state" in str(e):
+            if _is_stream_closed_error(e):
                 self._stream_broken = True
                 logger.debug("[SlackStream] Stream closed during text flush — suppressing further calls")
             else:
@@ -541,7 +568,7 @@ class SlackStreamConsumer:
                 chunks=[chunk],
             )
         except Exception as e:
-            if "message_not_in_streaming_state" in str(e):
+            if _is_stream_closed_error(e):
                 self._stream_broken = True
                 logger.debug("[SlackStream] Stream closed — suppressing further appendStream calls")
             else:
@@ -589,9 +616,10 @@ class SlackStreamConsumer:
         already closed the stream (server-side timeout), we can't append any
         more chunks but the content already rendered is intact.
 
-        When the stream is broken, falls back to ``chat.postMessage`` to
-        deliver the accumulated text so the user isn't left staring at
-        Slack's "Something went wrong" step card with no content.
+        When the stream is broken (either before or during finalization),
+        falls back to ``chat.postMessage`` to deliver the accumulated text
+        so the user isn't left staring at Slack's "Something went wrong"
+        step card with no content.
         """
         if self._stream_broken:
             # Stream is already closed server-side — try stopStream for
@@ -601,17 +629,18 @@ class SlackStreamConsumer:
             await self._fallback_post_message()
             return
 
-        _STREAM_CLOSED = "message_not_in_streaming_state"
-
         # Complete any still-active tool/thinking tasks
         for task_id, name in list(self._active_tasks.items()):
             try:
                 await self._send_task_step(task_id, name, "complete", "")
             except Exception as e:
-                err_str = str(e)
-                if _STREAM_CLOSED in err_str:
+                if _is_stream_closed_error(e):
                     logger.debug("[SlackStream] Stream already closed, skipping task completion for %s", name)
-                    break  # No point trying more tasks
+                    # Stream broke during finalization — fall back immediately
+                    self._stream_broken = True
+                    await self._try_stop_stream()
+                    await self._fallback_post_message()
+                    return
                 pass
 
         # Flush remaining text and mark the Response step as complete
@@ -633,12 +662,16 @@ class SlackStreamConsumer:
                 )
                 self._text_buffer = ""
             except Exception as e:
-                err_str = str(e)
-                if _STREAM_CLOSED in err_str:
+                if _is_stream_closed_error(e):
                     logger.debug(
                         "[SlackStream] Stream already closed before final text flush — "
-                        "content already rendered."
+                        "falling back to postMessage."
                     )
+                    # Stream broke during final text delivery — fall back
+                    self._stream_broken = True
+                    await self._try_stop_stream()
+                    await self._fallback_post_message()
+                    return
                 else:
                     logger.warning("[SlackStream] finalize Response step failed: %s", e)
 
@@ -700,8 +733,7 @@ class SlackStreamConsumer:
                 self._stream_ts,
             )
         except Exception as e:
-            err_str = str(e)
-            if "message_not_in_streaming_state" in err_str:
+            if _is_stream_closed_error(e):
                 logger.debug("[SlackStream] stopStream: stream already closed server-side")
             else:
                 logger.warning("[SlackStream] stopStream failed: %s", e)
