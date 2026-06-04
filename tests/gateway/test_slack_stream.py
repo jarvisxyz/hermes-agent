@@ -24,6 +24,8 @@ def mock_client():
     client.chat_startStream = AsyncMock(return_value={"ts": "1234567890.123456"})
     client.chat_appendStream = AsyncMock(return_value={"ok": True})
     client.chat_stopStream = AsyncMock(return_value={"ok": True})
+    client.chat_update = AsyncMock(return_value={"ok": True})
+    client.chat_postMessage = AsyncMock(return_value={"ok": True})
     return client
 
 
@@ -496,6 +498,11 @@ class TestStreamBrokenFallback:
     async def test_stream_broken_triggers_fallback(self, mock_client):
         """When appendStream fails with message_not_in_streaming_state,
         _stream_broken is set and _fallback_post_message delivers the text.
+
+        The fallback now tries chat.update first (Strategy 1) to replace
+        the broken stream message.  If that succeeds, postMessage is not
+        needed.  This test verifies the full fallback path by making
+        chat.update fail so postMessage is used (Strategy 2).
         """
         # Simulate SlackApiError with error code in response.data (not str())
         exc = Exception("The request to the Slack API failed.")
@@ -504,6 +511,7 @@ class TestStreamBrokenFallback:
         exc.response = resp
 
         mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_update = AsyncMock(return_value={"ok": False, "error": "cant_update"})
         mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
 
         cfg = SlackStreamConfig(flush_interval=0.01, buffer_threshold=5)
@@ -523,7 +531,9 @@ class TestStreamBrokenFallback:
         assert c.stream_broken is True
         # final_content_delivered should be True (via fallback)
         assert c.final_content_delivered is True
-        # chat_postMessage should have been called with the text
+        # chat_update should have been tried first (Strategy 1)
+        mock_client.chat_update.assert_called_once()
+        # chat_postMessage should have been called as Strategy 2
         mock_client.chat_postMessage.assert_called_once()
         call_kwargs = mock_client.chat_postMessage.call_args.kwargs
         assert "Hello world!" in call_kwargs["text"]
@@ -550,3 +560,148 @@ class TestStreamBrokenFallback:
         # stream_broken but no text → no fallback postMessage call
         assert c.stream_broken is True
         mock_client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fallback_formats_markdown(self, mock_client):
+        """format_message is called in the fallback to convert markdown → mrkdwn."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+        mock_client.chat_update = AsyncMock(return_value={"ok": False, "error": "cant_update_message"})
+
+        # Simple markdown→mrkdwn converter for testing
+        def fmt(text):
+            # Headers: ## Title → *Title* (Slack bold)
+            text = __import__("re").sub(r"^#{1,6}\s+(.+)$", lambda m: f"*{m.group(1)}*", text, flags=__import__("re").MULTILINE)
+            # Bold: **text** → *text*
+            text = __import__("re").sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+            # Links: [text](url) → <url|text>
+            text = __import__("re").sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<\2|\1>", text)
+            return text
+
+        cfg = SlackStreamConfig(flush_interval=0.01, buffer_threshold=5)
+        c = SlackStreamConsumer(
+            mock_client, "C0TEST", "123.456", config=cfg,
+            format_message=fmt,
+        )
+
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+        c.on_delta("## Results\n\n**Bold text** and [link](http://example.com)")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # chat_update should have been tried first (Strategy 1)
+        mock_client.chat_update.assert_called_once()
+        # chat_postMessage should also be called (Strategy 2, after update fails)
+        mock_client.chat_postMessage.assert_called_once()
+        call_kwargs = mock_client.chat_postMessage.call_args.kwargs
+        # The text should have been formatted by our format_message callable
+        assert "*Results*" in call_kwargs["text"]
+        assert "*Bold text*" in call_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_fallback_tries_chat_update_first(self, mock_client):
+        """Fallback tries chat.update to replace the broken stream message before postMessage."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_update = AsyncMock(return_value={"ok": True})
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        cfg = SlackStreamConfig(flush_interval=0.01, buffer_threshold=5)
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+        c.on_delta("Hello world!")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # chat.update should have been called on the stream message
+        mock_client.chat_update.assert_called_once()
+        update_kwargs = mock_client.chat_update.call_args.kwargs
+        assert update_kwargs["channel"] == "C0TEST"
+        assert update_kwargs["ts"] == "1234567890.123456"
+        assert "Hello world!" in update_kwargs["text"]
+        # chat_postMessage should NOT be called since chat.update succeeded
+        mock_client.chat_postMessage.assert_not_called()
+        assert c.final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_fallback_postmessage_when_update_fails(self, mock_client):
+        """When chat.update fails, fallback falls through to chat.postMessage."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_update = AsyncMock(return_value={"ok": False, "error": "cant_update_message"})
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        cfg = SlackStreamConfig(flush_interval=0.01, buffer_threshold=5)
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+        c.on_delta("Hello world!")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # Both should have been tried
+        mock_client.chat_update.assert_called_once()
+        mock_client.chat_postMessage.assert_called_once()
+        assert c.final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_fallback_no_format_message_still_works(self, mock_client):
+        """When format_message is not provided, fallback still sends raw text."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_update = AsyncMock(return_value={"ok": False, "error": "cant_update_message"})
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        cfg = SlackStreamConfig(flush_interval=0.01, buffer_threshold=5)
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+        # No format_message provided — should still work
+
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+        c.on_delta("## Raw markdown **bold**")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        call_kwargs = mock_client.chat_postMessage.call_args.kwargs
+        # Text should be raw — no format_message conversion
+        assert "## Raw markdown **bold**" in call_kwargs["text"]
+
+
+class TestFormatMessageIntegration:
+    """Tests for the format_message parameter and its integration with the consumer."""
+
+    def test_format_message_stored(self, mock_client):
+        """format_message callable is stored on the consumer instance."""
+        fmt = lambda t: t.upper()
+        c = SlackStreamConsumer(mock_client, "C0", "123", format_message=fmt)
+        assert c._format_message is fmt
+
+    def test_no_format_message_default(self, mock_client):
+        """Default consumer has no format_message (None)."""
+        c = SlackStreamConsumer(mock_client, "C0", "123")
+        assert c._format_message is None

@@ -1340,6 +1340,7 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts=thread_ts,
             config=config,
             metadata=metadata,
+            format_message=self.format_message,
         )
 
     def _dm_top_level_threads_as_sessions(self) -> bool:

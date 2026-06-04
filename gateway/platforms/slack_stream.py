@@ -154,12 +154,17 @@ class SlackStreamConsumer:
         thread_ts: str,
         config: Optional[SlackStreamConfig] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        format_message: Optional[Any] = None,
     ):
         self._client = client
         self._channel_id = channel_id
         self._thread_ts = thread_ts
         self._config = config or SlackStreamConfig()
         self._metadata = metadata or {}
+        # Callable that converts standard markdown → Slack mrkdwn.
+        # Passed from SlackAdapter.format_message so the fallback
+        # postMessage renders formatting correctly.
+        self._format_message = format_message
 
         # Thread-safe queue — on_delta / on_tool_progress are called from
         # the agent's worker thread; run() drains from the async loop.
@@ -682,18 +687,61 @@ class SlackStreamConsumer:
         self._final_content_delivered = True
 
     async def _fallback_post_message(self) -> None:
-        """Fall back to ``chat.postMessage`` when the stream is broken.
+        """Fall back when the stream is broken.
 
-        Delivers any accumulated text that wasn't flushed before the stream
-        died.  This ensures the user still gets the response content even
-        though the Slack Steps UI shows "Something went wrong" for the
-        incomplete step card.
+        Attempts to **replace** the broken stream message (which shows
+        "Something went wrong") by calling ``chat.update`` on the stream's
+        own ``ts`` with properly formatted mrkdwn text.  If that succeeds,
+        the error card is replaced with the actual response content and
+        the user never sees the "Something went wrong" banner.
+
+        If ``chat.update`` fails (e.g. Slack restricts editing of
+        assistant thread messages), falls back to ``chat.postMessage``
+        as a new thread reply instead.
+
+        The text is converted from standard markdown to Slack mrkdwn via
+        the ``format_message`` callable (passed from ``SlackAdapter`` at
+        construction time) so links, headers, bold/italic, and code blocks
+        render correctly.
         """
         text = self._text_buffer
         if not text:
             logger.debug("[SlackStream] No text to deliver via fallback postMessage")
             return
 
+        # Convert markdown → Slack mrkdwn if the formatter is available
+        if self._format_message:
+            try:
+                text = self._format_message(text)
+            except Exception as e:
+                logger.debug("[SlackStream] format_message failed in fallback: %s", e)
+
+        # Strategy 1: Update the broken stream message in-place to replace
+        # the "Something went wrong" card with properly formatted content.
+        if self._stream_ts:
+            try:
+                update_kwargs = {
+                    "channel": self._channel_id,
+                    "ts": self._stream_ts,
+                    "text": text,
+                }
+                result = await self._client.chat_update(**update_kwargs)
+                ok = result.get("ok", True) if isinstance(result, dict) else getattr(result, "data", {}).get("ok", True)
+                if ok is not False:
+                    logger.info(
+                        "[SlackStream] Replaced broken stream message via chat.update "
+                        "(channel=%s stream_ts=%s, %d chars)",
+                        self._channel_id, self._stream_ts, len(text),
+                    )
+                    self._final_content_delivered = True
+                    return
+                else:
+                    error = result.get("error", "unknown") if isinstance(result, dict) else "unknown"
+                    logger.debug("[SlackStream] chat.update on stream msg failed: %s — falling back to postMessage", error)
+            except Exception as e:
+                logger.debug("[SlackStream] chat.update on stream msg raised: %s — falling back to postMessage", e)
+
+        # Strategy 2: Post a new message in the thread
         try:
             kwargs = {
                 "channel": self._channel_id,
