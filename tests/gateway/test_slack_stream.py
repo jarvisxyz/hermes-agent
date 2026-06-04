@@ -12,6 +12,8 @@ from gateway.platforms.slack_stream import (
     _DELTA,
     _TASK_START,
     _TASK_UPDATE,
+    _is_stream_closed_error,
+    _STREAM_CLOSED_ERROR,
 )
 
 
@@ -418,3 +420,133 @@ class TestSlackStreamConfig:
         assert cfg.set_title is True
         assert cfg.feedback_buttons is True
         assert cfg.response_step_title == "Response"
+
+
+class TestIsStreamClosedError:
+    """Tests for _is_stream_closed_error — the helper that reliably detects
+    Slack's message_not_in_streaming_state error from SlackApiError objects.
+
+    The Slack SDK's SlackApiError.__str__() does NOT include the actual
+    error code — it only shows the generic message like "The request to the
+    Slack API failed."  The real error code lives in e.response.data["error"],
+    so we must inspect that field, not just str(e).
+    """
+
+    def test_error_code_in_str(self):
+        """When str(e) contains the error code (some SDK versions), detect it."""
+        exc = Exception(f"something {_STREAM_CLOSED_ERROR} happened")
+        assert _is_stream_closed_error(exc) is True
+
+    def test_error_code_in_response_data(self):
+        """When str(e) lacks the code but e.response.data has it, detect it.
+
+        This is the real-world case: slack_sdk.errors.SlackApiError produces
+        str(e) = "The request to the Slack API failed. (url: …)" without the
+        actual error code, but e.response.data["error"] contains it.
+        """
+        exc = Exception("The request to the Slack API failed.")
+        # Simulate SlackApiError's .response attribute
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+        assert _is_stream_closed_error(exc) is True
+
+    def test_no_response_attribute(self):
+        """Plain Exception without .response — only str(e) is checked."""
+        exc = Exception("some other error")
+        assert _is_stream_closed_error(exc) is False
+
+    def test_response_data_with_different_error(self):
+        """e.response.data["error"] is a different code — not stream-closed."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": "no_text"}
+        exc.response = resp
+        assert _is_stream_closed_error(exc) is False
+
+    def test_response_data_empty(self):
+        """e.response.data is empty dict — not stream-closed."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {}
+        exc.response = resp
+        assert _is_stream_closed_error(exc) is False
+
+    def test_response_data_none(self):
+        """e.response.data is None — not stream-closed."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = None
+        exc.response = resp
+        assert _is_stream_closed_error(exc) is False
+
+    def test_response_none(self):
+        """e.response is None — not stream-closed."""
+        exc = Exception("The request to the Slack API failed.")
+        exc.response = None
+        assert _is_stream_closed_error(exc) is False
+
+
+class TestStreamBrokenFallback:
+    """When the stream dies mid-delivery, the consumer should fall back to
+    chat.postMessage so the user still gets the response text.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stream_broken_triggers_fallback(self, mock_client):
+        """When appendStream fails with message_not_in_streaming_state,
+        _stream_broken is set and _fallback_post_message delivers the text.
+        """
+        # Simulate SlackApiError with error code in response.data (not str())
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        cfg = SlackStreamConfig(flush_interval=0.01, buffer_threshold=5)
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+
+        # Send text — it should buffer but fail to flush via stream
+        c.on_delta("Hello world! This is the response text.")
+        await asyncio.sleep(0.15)
+
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # stream_broken should be True
+        assert c.stream_broken is True
+        # final_content_delivered should be True (via fallback)
+        assert c.final_content_delivered is True
+        # chat_postMessage should have been called with the text
+        mock_client.chat_postMessage.assert_called_once()
+        call_kwargs = mock_client.chat_postMessage.call_args.kwargs
+        assert "Hello world!" in call_kwargs["text"]
+        assert call_kwargs["channel"] == "C0TEST"
+        assert call_kwargs["thread_ts"] == "123.456"
+
+    @pytest.mark.asyncio
+    async def test_stream_broken_no_text_no_fallback(self, mock_client):
+        """When stream breaks but no text was buffered, fallback is skipped."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456")
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # stream_broken but no text → no fallback postMessage call
+        assert c.stream_broken is True
+        mock_client.chat_postMessage.assert_not_called()
