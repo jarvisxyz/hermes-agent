@@ -438,22 +438,25 @@ class SlackStreamConsumer:
 
         In plan mode, ``markdown_text`` is not allowed — text must be carried
         inside a ``TaskUpdateChunk.output`` field.  We maintain a "Response"
-        step and update it with the full accumulated text each flush.
+        step and update it with the new text each flush.
+
+        Slack's ``chat.appendStream`` **appends** the ``output`` field across
+        updates (same as ``details``), so we must send only the delta — the
+        new text since the last flush — not the full buffer.
         """
         if not self._text_buffer or not self._stream_ts:
             return
+        # Only send text we haven't already flushed
+        new_text = self._text_buffer[self._total_text_sent:]
+        if not new_text:
+            return
         try:
             step_id = await self._ensure_response_step()
-            # Build the full output so far
-            full_text = self._text_buffer[:self._total_text_sent + len(self._text_buffer)]
-            # Actually just send what we have — the output field replaces the
-            # previous value for this step ID
-            full_output = self._text_buffer
             chunk = self._make_task_chunk(
                 step_id,
                 self._config.response_step_title,
                 "in_progress",
-                output=full_output,
+                output=new_text,
             )
             await self._client.chat_appendStream(
                 channel=self._channel_id,
@@ -461,8 +464,8 @@ class SlackStreamConsumer:
                 chunks=[chunk],
             )
             self._total_text_sent = len(self._text_buffer)
-            # Don't clear the buffer yet — we need the full text for the next
-            # incremental update (Slack replaces the entire output each time)
+            # Don't clear the buffer — we need the full text to compute
+            # the delta for the next flush.
         except Exception as e:
             logger.warning("[SlackStream] flush text to Response step failed: %s", e)
 
@@ -530,12 +533,13 @@ class SlackStreamConsumer:
         if self._text_buffer or self._response_step_id:
             try:
                 step_id = await self._ensure_response_step()
-                full_output = self._text_buffer or ""
+                # Only send text not yet flushed (Slack appends output)
+                new_text = (self._text_buffer or "")[self._total_text_sent:]
                 chunk = self._make_task_chunk(
                     step_id,
                     self._config.response_step_title,
                     "complete",
-                    output=full_output,
+                    output=new_text or None,
                 )
                 await self._client.chat_appendStream(
                     channel=self._channel_id,

@@ -17130,6 +17130,10 @@ class GatewayRunner:
             """Callback invoked by agent on tool lifecycle events."""
             if not progress_queue or not _run_still_current():
                 return
+            # When Slack native Steps API is active, progress is rendered
+            # inside the stream card — skip the legacy progress bubbles.
+            if _slack_native_stream_active[0]:
+                return
 
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
@@ -17595,6 +17599,7 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+        _slack_native_stream_active = [False]  # Set True when Slack Steps API is in use
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -17643,6 +17648,11 @@ class GatewayRunner:
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
+                return
+            # When Slack native Steps API is active, status messages like
+            # "Analyzing..." or "Summarizing findings..." create phantom
+            # bubbles below the stream card — suppress them.
+            if _slack_native_stream_active[0]:
                 return
             prepared_message = _prepare_gateway_status_message(
                 source.platform,
@@ -17782,6 +17792,7 @@ class GatewayRunner:
                                         metadata=_status_thread_metadata,
                                     )
                                     _use_slack_native_stream = True
+                                    _slack_native_stream_active[0] = True
                                     if _want_stream_deltas:
                                         def _stream_delta_cb(text: str) -> None:
                                             if _run_still_current():
