@@ -75,15 +75,18 @@ class TestOnToolProgress:
         item = consumer._queue.get_nowait()
         assert item[0] is _TASK_START
         assert item[1] == "tool_1"
-        assert item[2] == "web_search"
+        # Title is now human-readable with preview
+        assert item[2] == "Web search: query"
         assert item[3] == "in_progress"
-        assert item[4] == "query"
+        # Description is built from args when no preview
+        assert item[4] == ""
 
     def test_tool_started_with_args(self, consumer):
         consumer.on_tool_progress("tool.started", tool_name="terminal", args={"command": "ls -la"})
         item = consumer._queue.get_nowait()
         assert item[0] is _TASK_START
-        assert item[2] == "terminal"
+        # Title includes the formatted tool name + preview from args
+        assert "Terminal" in item[2]
         assert "command" in item[4]
 
     def test_tool_completed(self, consumer):
@@ -93,8 +96,10 @@ class TestOnToolProgress:
         consumer.on_tool_progress("tool.completed", tool_name="web_search", duration=2.5)
         item = consumer._queue.get_nowait()
         assert item[0] is _TASK_UPDATE
-        assert item[2] == "web_search"
+        assert item[2] == "Web search"  # formatted title
         assert item[3] == "complete"
+        # Description includes completion status with duration
+        assert "Done" in item[4]
         assert "2.5s" in item[4]
 
     def test_ignores_unknown_event(self, consumer):
@@ -222,12 +227,69 @@ class TestRunLifecycle:
         assert len(md_calls) == 0
 
 
+class TestFormatToolTitle:
+    def test_known_tool(self):
+        assert SlackStreamConsumer._format_tool_title("search_files") == "Search files"
+
+    def test_known_tool_with_preview(self):
+        assert SlackStreamConsumer._format_tool_title("terminal", "ls -la") == "Terminal: ls -la"
+
+    def test_unknown_tool(self):
+        assert SlackStreamConsumer._format_tool_title("my_custom_tool") == "My Custom Tool"
+
+    def test_long_preview_truncated(self):
+        title = SlackStreamConsumer._format_tool_title("terminal", "x" * 100)
+        assert len(title) <= len("Terminal: ") + 60 + 1  # +1 for ellipsis
+        assert title.endswith("…")
+
+    def test_empty_preview(self):
+        assert SlackStreamConsumer._format_tool_title("web_search", "") == "Web search"
+
+
+class TestInitialStep:
+    @pytest.mark.asyncio
+    async def test_initial_step_emitted_on_start(self, consumer, mock_client):
+        """startStream immediately emits a 'Processing' step."""
+        run_task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        # The initial step should have been sent
+        append_calls = mock_client.chat_appendStream.call_args_list
+        # At least one call should exist for the initial step
+        assert len(append_calls) >= 1
+        consumer.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_initial_step_completed_on_first_tool(self, consumer, mock_client):
+        """Initial step is completed when the first tool starts."""
+        run_task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.on_tool_progress("tool.started", tool_name="web_search", preview="test")
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+        # The initial step should have been completed (not left hanging)
+        assert consumer._initial_step_id is None
+
+    @pytest.mark.asyncio
+    async def test_initial_step_completed_on_first_delta(self, consumer, mock_client):
+        """Initial step is completed when the first text delta arrives."""
+        run_task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.05)
+        consumer.on_delta("Hello!")
+        await asyncio.sleep(0.15)
+        consumer.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+        assert consumer._initial_step_id is None
+
+
 class TestTaskIdTracking:
     def test_incrementing_task_ids(self, consumer):
         consumer.on_tool_progress("tool.started", tool_name="tool_a")
         consumer.on_tool_progress("tool.started", tool_name="tool_b")
         item_a = consumer._queue.get_nowait()
         item_b = consumer._queue.get_nowait()
+        # IDs are sequential (counter starts at 0, first on_tool_progress increments)
         assert item_a[1] == "tool_1"
         assert item_b[1] == "tool_2"
 
@@ -238,6 +300,23 @@ class TestTaskIdTracking:
         consumer.on_tool_progress("tool.completed", tool_name="web_search")
         update_item = consumer._queue.get_nowait()
         assert update_item[1] == task_id
+
+    def test_completed_preserves_description(self, consumer):
+        """Completed tool step preserves in-progress description before 'Done'."""
+        consumer.on_tool_progress(
+            "tool.started", tool_name="terminal", args={"command": "ls -la"},
+        )
+        consumer._queue.get_nowait()  # consume start
+        consumer.on_tool_progress(
+            "tool.completed", tool_name="terminal", duration=1.2,
+        )
+        item = consumer._queue.get_nowait()
+        # Description should contain both the original args and the completion
+        assert "command" in item[4]
+        assert "Done" in item[4]
+        assert "1.2s" in item[4]
+        # The description should have a newline separating them
+        assert "\n" in item[4]
 
 
 class TestMakeTaskChunk:
@@ -271,12 +350,13 @@ class TestFlushText:
         """Text is flushed to Response step when buffer exceeds threshold."""
         cfg = SlackStreamConfig(flush_interval=100, buffer_threshold=20)
         c = SlackStreamConsumer(mock_client, "C0", "123.456", config=cfg)
-        # Simulate the run loop manually
-        await c._start_stream()
+        # Start the run loop, which calls _start_stream internally
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
         c.on_delta("A" * 30)  # exceeds threshold of 20
-        # Let the run loop process it
+        await asyncio.sleep(0.15)
         c.finish()
-        await c.run()
+        await asyncio.wait_for(run_task, timeout=5.0)
         # Verify appendStream was called with chunks (not markdown_text)
         chunk_calls = [
             call for call in mock_client.chat_appendStream.call_args_list
