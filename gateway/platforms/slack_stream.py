@@ -491,7 +491,11 @@ class SlackStreamConsumer:
             # Don't clear the buffer — we need the full text to compute
             # the delta for the next flush.
         except Exception as e:
-            logger.warning("[SlackStream] flush text to Response step failed: %s", e)
+            if "message_not_in_streaming_state" in str(e):
+                self._stream_broken = True
+                logger.debug("[SlackStream] Stream closed during text flush — suppressing further calls")
+            else:
+                logger.warning("[SlackStream] flush text to Response step failed: %s", e)
 
     async def _send_task_step(self, task_id: str, name: str, status: str, description: str) -> None:
         """Send a TaskUpdateChunk for a tool/thinking step."""
