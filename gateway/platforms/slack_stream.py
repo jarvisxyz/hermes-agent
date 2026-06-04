@@ -150,9 +150,14 @@ class SlackStreamConsumer:
 
         # Track active tasks so we can complete/fail them
         self._active_tasks: Dict[str, str] = {}  # task_id → name
+        self._active_task_descs: Dict[str, str] = {}  # task_id → in-progress description
 
         # Whether we've started the Response step
         self._response_step_id: Optional[str] = None
+
+        # ID of the initial "Processing" step emitted at stream start
+        # to replace Slack's "Gathering information…" placeholder
+        self._initial_step_id: Optional[str] = None
 
         # Total text sent so far (for incremental output updates)
         self._total_text_sent: int = 0
@@ -161,6 +166,60 @@ class SlackStreamConsumer:
         self._started: bool = False
 
     # ── Public sync callbacks (called from agent worker thread) ───────
+
+    # Friendly display names for tool step titles.  Tools not listed here
+    # fall back to title-case conversion of the snake_case name.
+    _TOOL_DISPLAY_NAMES: Dict[str, str] = {
+        "terminal": "Terminal",
+        "web_search": "Web search",
+        "web_extract": "Web extract",
+        "read_file": "Read file",
+        "write_file": "Write file",
+        "patch": "Patch",
+        "search_files": "Search files",
+        "browser_navigate": "Navigate",
+        "browser_click": "Click",
+        "browser_type": "Type",
+        "browser_snapshot": "Snapshot",
+        "browser_vision": "Vision",
+        "browser_scroll": "Scroll",
+        "browser_press": "Press key",
+        "browser_back": "Back",
+        "browser_get_images": "Get images",
+        "browser_console": "Console",
+        "image_generate": "Image generate",
+        "text_to_speech": "Text to speech",
+        "vision_analyze": "Vision analyze",
+        "execute_code": "Execute code",
+        "delegate_task": "Delegate task",
+        "clarify": "Clarify",
+        "skill_view": "Skill view",
+        "skills_list": "Skills list",
+        "skill_manage": "Skill manage",
+        "memory": "Memory",
+        "cronjob": "Cron job",
+        "todo": "Todo",
+        "process": "Process",
+        "send_message": "Send message",
+        "session_search": "Session search",
+    }
+
+    @classmethod
+    def _format_tool_title(cls, tool_name: str, preview: str = "") -> str:
+        """Return a human-readable step title for a tool.
+
+        If a preview string is available (the primary argument), it's
+        appended after a colon for immediate visibility in the step card.
+        """
+        display = cls._TOOL_DISPLAY_NAMES.get(tool_name)
+        if display is None:
+            # Fallback: convert snake_case to Title Case
+            display = tool_name.replace("_", " ").title()
+        if preview:
+            # Truncate long previews for the title
+            short = preview[:60] + ("…" if len(preview) > 60 else "")
+            return f"{display}: {short}"
+        return display
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread."""
@@ -184,15 +243,18 @@ class SlackStreamConsumer:
         if event_type == "tool.started" and tool_name:
             self._task_counter += 1
             task_id = f"tool_{self._task_counter}"
-            desc = preview or ""
-            if not desc and args:
-                # Build a short description from the first argument
+            # Build the description from args if no preview
+            desc = ""
+            if not preview and args:
                 first_key = next(iter(args), None)
                 if first_key:
                     val = str(args[first_key])[:80]
                     desc = f"{first_key}: {val}"
-            self._queue.put((_TASK_START, task_id, tool_name, "in_progress", desc))
+            # Format a human-readable title with preview (e.g. "Search files: *.py")
+            title = self._format_tool_title(tool_name, preview or desc)
+            self._queue.put((_TASK_START, task_id, title, "in_progress", desc))
             self._active_tasks[task_id] = tool_name
+            self._active_task_descs[task_id] = desc
 
         elif event_type == "tool.completed" and tool_name:
             # Find the matching active task
@@ -203,9 +265,17 @@ class SlackStreamConsumer:
                     break
             if task_id:
                 duration = kwargs.get("duration", 0)
-                desc = f"Done ({duration:.1f}s)" if duration else "Done"
-                self._queue.put((_TASK_UPDATE, task_id, tool_name, "complete", desc))
+                dur_str = f" ({duration:.1f}s)" if duration else ""
+                # Preserve the in-progress details and append completion status
+                prev_desc = self._active_task_descs.get(task_id, "")
+                if prev_desc:
+                    desc = f"{prev_desc}\nDone{dur_str}"
+                else:
+                    desc = f"Done{dur_str}"
+                title = self._format_tool_title(tool_name)
+                self._queue.put((_TASK_UPDATE, task_id, title, "complete", desc))
                 self._active_tasks.pop(task_id, None)
+                self._active_task_descs.pop(task_id, None)
 
     def on_thinking_start(self) -> None:
         """Signal that the model is thinking/reasoning."""
@@ -266,6 +336,7 @@ class SlackStreamConsumer:
             kind = item[0]
 
             if kind is _DELTA:
+                await self._complete_initial_step()
                 self._text_buffer += item[1]
                 now = time.monotonic()
                 if len(self._text_buffer) >= self._config.buffer_threshold or \
@@ -275,6 +346,7 @@ class SlackStreamConsumer:
 
             elif kind is _TASK_START:
                 _, task_id, task_name, status, desc = item
+                await self._complete_initial_step(replacement_title=task_name)
                 await self._send_task_step(task_id, task_name, status, desc)
 
             elif kind is _TASK_UPDATE:
@@ -283,8 +355,35 @@ class SlackStreamConsumer:
 
     # ── Slack API calls ──────────────────────────────────────────────
 
+    async def _complete_initial_step(
+        self, replacement_title: Optional[str] = None,
+    ) -> None:
+        """Complete the initial 'Processing' step once real content arrives.
+
+        If *replacement_title* is given (e.g. the formatted name of the first
+        tool), the initial step's title is updated to show it before being
+        marked complete — this way the user sees the actual tool name flash
+        briefly before the dedicated tool step card takes over.
+        """
+        if self._initial_step_id is None:
+            return
+        step_id = self._initial_step_id
+        self._initial_step_id = None  # only complete once
+        try:
+            title = replacement_title or "Processing"
+            await self._send_task_step(step_id, title, "complete", "")
+            self._active_tasks.pop(step_id, None)
+        except Exception as e:
+            logger.debug("[SlackStream] complete_initial_step failed: %s", e)
+
     async def _start_stream(self) -> None:
-        """Initiate a streaming message via chat.startStream in plan mode."""
+        """Initiate a streaming message via chat.startStream in plan mode.
+
+        Immediately emits an initial "Processing…" step so Slack's built-in
+        "Gathering information…" placeholder is replaced as fast as possible.
+        This step is completed once the first real tool step or text delta
+        arrives.
+        """
         resp = await self._client.chat_startStream(
             channel=self._channel_id,
             thread_ts=self._thread_ts,
@@ -300,6 +399,20 @@ class SlackStreamConsumer:
             self._channel_id, self._thread_ts, self._stream_ts,
         )
         self._started = True
+
+        # Emit an initial step immediately to replace Slack's "Gathering
+        # information…" placeholder.  This step will be completed (and
+        # potentially replaced by the first real tool step) as soon as
+        # the agent starts producing output.
+        self._task_counter += 1
+        self._initial_step_id = f"init_{self._task_counter}"
+        await self._send_task_step(
+            self._initial_step_id,
+            "Processing",
+            "in_progress",
+            "",
+        )
+        self._active_tasks[self._initial_step_id] = "Processing"
 
     async def _ensure_response_step(self) -> str:
         """Create the Response step if it doesn't exist yet, return its ID."""
