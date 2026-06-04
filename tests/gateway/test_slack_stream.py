@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -422,6 +423,9 @@ class TestSlackStreamConfig:
         assert cfg.set_title is True
         assert cfg.feedback_buttons is True
         assert cfg.response_step_title == "Response"
+        assert cfg.keepalive_interval == 120.0
+        assert cfg.keepalive_enabled is True
+        assert "streaming display disconnected" in cfg.fallback_explanation.lower()
 
 
 class TestIsStreamClosedError:
@@ -705,3 +709,281 @@ class TestFormatMessageIntegration:
         """Default consumer has no format_message (None)."""
         c = SlackStreamConsumer(mock_client, "C0", "123")
         assert c._format_message is None
+
+
+class TestKeepAlive:
+    """Tests for the keep-alive ping mechanism that prevents Slack from
+    closing idle streams during long tool execution gaps.
+    """
+
+    @pytest.mark.asyncio
+    async def test_keepalive_sends_ping_on_idle(self, mock_client):
+        """When the stream is idle for keepalive_interval, a ping step is sent."""
+        cfg = SlackStreamConfig(
+            flush_interval=0.01,
+            buffer_threshold=50,
+            keepalive_interval=0.1,  # very short for testing
+            keepalive_enabled=True,
+        )
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+
+        # Artificially set _last_activity far back to trigger keepalive
+        c._last_activity = time.monotonic() - 0.2  # idle for 0.2s (> 0.1 interval)
+        await asyncio.sleep(0.3)  # give run loop time to detect idle & send ping
+
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # At least one appendStream call should have been for the keep-alive step
+        assert mock_client.chat_appendStream.call_count >= 2  # init + keepalive
+
+    @pytest.mark.asyncio
+    async def test_keepalive_completed_on_real_activity(self, mock_client):
+        """Keep-alive step is completed when real work arrives."""
+        cfg = SlackStreamConfig(
+            flush_interval=0.01,
+            buffer_threshold=5,
+            keepalive_interval=0.1,
+            keepalive_enabled=True,
+        )
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+
+        # Force idle to trigger keepalive
+        c._last_activity = time.monotonic() - 0.2
+        await asyncio.sleep(0.3)
+
+        # Now send real work — this should complete the keepalive step
+        c.on_delta("Real content arrives")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # The keepalive step should have been completed
+        assert c._keepalive_step_id is None
+
+    @pytest.mark.asyncio
+    async def test_keepalive_disabled(self, mock_client):
+        """When keepalive_enabled is False, no ping is sent even during idle."""
+        cfg = SlackStreamConfig(
+            flush_interval=0.01,
+            buffer_threshold=50,
+            keepalive_interval=0.1,
+            keepalive_enabled=False,
+        )
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+
+        # Set idle far back — but keepalive is disabled, so nothing happens
+        c._last_activity = time.monotonic() - 1.0
+        await asyncio.sleep(0.3)
+
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # Only 1 appendStream call (the initial step) — no keepalive
+        # (stopStream is called but that's a different method)
+        append_calls = mock_client.chat_appendStream.call_args_list
+        # Should be just the initial "Processing" step + completing it
+        # (no keepalive step was created)
+        assert c._keepalive_step_id is None
+
+    @pytest.mark.asyncio
+    async def test_keepalive_updates_existing_step(self, mock_client):
+        """Subsequent keepalive pings update the same step (not create new ones)."""
+        cfg = SlackStreamConfig(
+            flush_interval=0.01,
+            buffer_threshold=50,
+            keepalive_interval=0.1,
+            keepalive_enabled=True,
+        )
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+
+        # Force idle to trigger first keepalive
+        c._last_activity = time.monotonic() - 0.2
+        await asyncio.sleep(0.3)
+
+        # The keepalive step ID should be set
+        first_keepalive_id = c._keepalive_step_id
+
+        # Reset activity again (simulating continued idle)
+        c._last_activity = time.monotonic() - 0.2
+        await asyncio.sleep(0.3)
+
+        # Same step ID should be reused (not a new one)
+        assert c._keepalive_step_id == first_keepalive_id
+
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_keepalive_skipped_when_stream_broken(self, mock_client):
+        """No keepalive is sent once the stream is broken."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+
+        cfg = SlackStreamConfig(
+            flush_interval=0.01,
+            buffer_threshold=5,
+            keepalive_interval=0.1,
+            keepalive_enabled=True,
+        )
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+
+        c.on_delta("Some text")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # Stream is broken — no keepalive step should exist
+        assert c._keepalive_step_id is None
+        assert c.stream_broken is True
+
+
+class TestFallbackExplanation:
+    """Tests for the fallback_explanation config that prepends a user-friendly
+    message when the stream breaks and content is delivered via postMessage.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fallback_explanation_prepended(self, mock_client):
+        """When the stream breaks, the fallback message includes the explanatory prefix."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_update = AsyncMock(return_value={"ok": False, "error": "cant_update_message"})
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        cfg = SlackStreamConfig(
+            flush_interval=0.01,
+            buffer_threshold=5,
+            fallback_explanation="_Stream display disconnected — response is intact._\n\n",
+        )
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+        c.on_delta("Hello world!")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # postMessage should have been called with explanation + text
+        mock_client.chat_postMessage.assert_called_once()
+        call_kwargs = mock_client.chat_postMessage.call_args.kwargs
+        assert "Stream display disconnected" in call_kwargs["text"]
+        assert "Hello world!" in call_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_fallback_explanation_disabled(self, mock_client):
+        """When fallback_explanation is empty, no prefix is prepended."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_update = AsyncMock(return_value={"ok": False, "error": "cant_update_message"})
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        cfg = SlackStreamConfig(
+            flush_interval=0.01,
+            buffer_threshold=5,
+            fallback_explanation="",
+        )
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+        c.on_delta("Hello world!")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        call_kwargs = mock_client.chat_postMessage.call_args.kwargs
+        assert call_kwargs["text"] == "Hello world!"
+
+    @pytest.mark.asyncio
+    async def test_fallback_explanation_formatted_with_format_message(self, mock_client):
+        """The explanation text is also passed through format_message for mrkdwn conversion."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_update = AsyncMock(return_value={"ok": False, "error": "cant_update_message"})
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        def fmt(text):
+            # Convert _italic_ → _italic_ (Slack mrkdwn uses same syntax, just verify it passes through)
+            return text.replace("**", "*")
+
+        cfg = SlackStreamConfig(
+            flush_interval=0.01,
+            buffer_threshold=5,
+            fallback_explanation="_Stream disconnected — response intact._\n\n",
+        )
+        c = SlackStreamConsumer(
+            mock_client, "C0TEST", "123.456", config=cfg,
+            format_message=fmt,
+        )
+
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+        c.on_delta("## Bold **text** here")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        call_kwargs = mock_client.chat_postMessage.call_args.kwargs
+        # The response text should have been formatted (** → *)
+        assert "*Bold *text* here*" in call_kwargs["text"] or "Bold" in call_kwargs["text"]
+        # The explanation should also appear
+        assert "Stream disconnected" in call_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_chat_update_succeeds_no_explanation(self, mock_client):
+        """When chat.update succeeds, no explanation is needed (the error card is replaced)."""
+        exc = Exception("The request to the Slack API failed.")
+        resp = MagicMock()
+        resp.data = {"ok": False, "error": _STREAM_CLOSED_ERROR}
+        exc.response = resp
+
+        mock_client.chat_appendStream.side_effect = exc
+        mock_client.chat_update = AsyncMock(return_value={"ok": True})
+        mock_client.chat_postMessage = AsyncMock(return_value={"ok": True})
+
+        cfg = SlackStreamConfig(
+            flush_interval=0.01,
+            buffer_threshold=5,
+            fallback_explanation="_Explanation text_\n\n",
+        )
+        c = SlackStreamConsumer(mock_client, "C0TEST", "123.456", config=cfg)
+
+        run_task = asyncio.create_task(c.run())
+        await asyncio.sleep(0.05)
+        c.on_delta("Hello world!")
+        await asyncio.sleep(0.15)
+        c.finish()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+        # chat.update succeeded — no explanation needed, postMessage not called
+        mock_client.chat_update.assert_called_once()
+        mock_client.chat_postMessage.assert_not_called()
+        assert c.final_content_delivered is True

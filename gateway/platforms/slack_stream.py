@@ -121,6 +121,20 @@ class SlackStreamConfig:
     feedback_buttons: bool = True
     # Title for the Response step that carries the LLM text output
     response_step_title: str = "Response"
+    # ── Keep-alive settings ──────────────────────────────────────
+    # How long (seconds) with no queue activity before sending a
+    # keep-alive ping.  Slack closes idle streams after ~5 min;
+    # 120 s gives comfortable margin with minimal API overhead.
+    keepalive_interval: float = 120.0
+    # Whether keep-alive pings are enabled (default: True)
+    keepalive_enabled: bool = True
+    # ── Fallback message settings ─────────────────────────────────
+    # Explanatory prefix prepended to the fallback chat.postMessage
+    # when the stream breaks, so users aren't confused by the
+    # "Something went wrong" banner.  Set to "" to disable.
+    fallback_explanation: str = (
+        "_The streaming display disconnected, but the response was completed successfully._\n\n"
+    )
 
 
 class SlackStreamConsumer:
@@ -206,6 +220,14 @@ class SlackStreamConsumer:
         # fallback postMessage).  The gateway checks this to avoid duplicate
         # sends.
         self._final_content_delivered: bool = False
+
+        # ── Keep-alive state ─────────────────────────────────────────
+        # Timestamp of the last queue activity (delta, task, or done).
+        # Used to detect idle periods where a keep-alive ping is needed.
+        self._last_activity: float = time.monotonic()
+        # ID of a keep-alive step currently in "in_progress" state.
+        # Updated (not recreated) on each ping to avoid accumulating steps.
+        self._keepalive_step_id: Optional[str] = None
 
     # ── Public properties ──────────────────────────────────────────────
 
@@ -397,8 +419,26 @@ class SlackStreamConsumer:
                 if self._text_buffer and (now - last_flush) >= self._config.flush_interval:
                     await self._flush_text()
                     last_flush = now
+
+                # Keep-alive ping: if no queue activity for keepalive_interval,
+                # send a lightweight step update to prevent Slack from closing
+                # the stream due to inactivity.
+                if (
+                    self._config.keepalive_enabled
+                    and not self._stream_broken
+                    and (now - self._last_activity) >= self._config.keepalive_interval
+                ):
+                    await self._send_keepalive()
+                    self._last_activity = now
+
                 await asyncio.sleep(0.05)
                 continue
+
+            # Any queue item counts as activity — reset the idle timer
+            self._last_activity = time.monotonic()
+
+            # If we had a keep-alive step, complete it now that real work arrived
+            await self._complete_keepalive()
 
             if item is _DONE:
                 # Finalize any remaining text and active tasks
@@ -614,6 +654,80 @@ class SlackStreamConsumer:
                 chunk["output"] = output
             return chunk
 
+    async def _send_keepalive(self) -> None:
+        """Send a keep-alive ping to prevent Slack from closing the idle stream.
+
+        Updates an existing keep-alive step (or creates one if this is the
+        first ping) with an ``in_progress`` status and a timestamp.  The step
+        is completed when real activity resumes (see ``_complete_keepalive``).
+        Reusing a single step avoids accumulating steps during long tool runs.
+        """
+        if self._stream_broken or not self._stream_ts:
+            return
+
+        elapsed = time.monotonic() - self._last_activity
+        # Human-friendly label: "Still working… (2m)"
+        mins = int(elapsed) // 60
+        secs = int(elapsed) % 60
+        if mins > 0:
+            label = f"Still working… ({mins}m {secs}s)"
+        else:
+            label = f"Still working… ({secs}s)"
+
+        if self._keepalive_step_id is None:
+            # First keep-alive — create a new step
+            self._task_counter += 1
+            self._keepalive_step_id = f"keepalive_{self._task_counter}"
+            try:
+                await self._send_task_step(
+                    self._keepalive_step_id, label, "in_progress", ""
+                )
+                logger.debug(
+                    "[SlackStream] Keep-alive ping sent (first, %.0fs idle)",
+                    elapsed,
+                )
+            except Exception as e:
+                if _is_stream_closed_error(e):
+                    self._stream_broken = True
+                else:
+                    logger.debug("[SlackStream] Keep-alive ping failed: %s", e)
+                self._keepalive_step_id = None
+        else:
+            # Subsequent pings — update the existing step with refreshed label
+            try:
+                await self._send_task_step(
+                    self._keepalive_step_id, label, "in_progress", ""
+                )
+                logger.debug(
+                    "[SlackStream] Keep-alive ping sent (update, %.0fs idle)",
+                    elapsed,
+                )
+            except Exception as e:
+                if _is_stream_closed_error(e):
+                    self._stream_broken = True
+                else:
+                    logger.debug("[SlackStream] Keep-alive ping update failed: %s", e)
+                self._keepalive_step_id = None
+
+    async def _complete_keepalive(self) -> None:
+        """Complete the keep-alive step (if active) when real work arrives.
+
+        Called from the run loop whenever a queue item is dequeued — i.e.
+        a delta, task event, or done signal.  The keep-alive step is
+        marked complete and cleared so the next idle period creates a fresh one.
+        """
+        if self._keepalive_step_id is None or self._stream_broken:
+            return
+        step_id = self._keepalive_step_id
+        self._keepalive_step_id = None
+        try:
+            await self._send_task_step(step_id, "Still working…", "complete", "")
+        except Exception as e:
+            if _is_stream_closed_error(e):
+                self._stream_broken = True
+            else:
+                logger.debug("[SlackStream] Keep-alive complete failed: %s", e)
+
     async def _finalize(self) -> None:
         """Flush remaining text, complete active tasks, and stop the stream.
 
@@ -697,7 +811,10 @@ class SlackStreamConsumer:
 
         If ``chat.update`` fails (e.g. Slack restricts editing of
         assistant thread messages), falls back to ``chat.postMessage``
-        as a new thread reply instead.
+        as a new thread reply instead.  In that case, a brief explanatory
+        prefix (``fallback_explanation``) is prepended so the user
+        understands that the "Something went wrong" banner is a display
+        issue — not an actual failure.
 
         The text is converted from standard markdown to Slack mrkdwn via
         the ``format_message`` callable (passed from ``SlackAdapter`` at
@@ -741,11 +858,22 @@ class SlackStreamConsumer:
             except Exception as e:
                 logger.debug("[SlackStream] chat.update on stream msg raised: %s — falling back to postMessage", e)
 
-        # Strategy 2: Post a new message in the thread
+        # Strategy 2: Post a new message in the thread.
+        # Prepend the explanatory prefix (if configured) so users understand
+        # the "Something went wrong" banner is just a display glitch.
+        explanation = self._config.fallback_explanation or ""
+        if explanation and self._format_message:
+            # Format the explanation too (it may contain mrkdwn like _italic_)
+            try:
+                explanation = self._format_message(explanation)
+            except Exception:
+                pass
+        delivered_text = explanation + text
+
         try:
             kwargs = {
                 "channel": self._channel_id,
-                "text": text,
+                "text": delivered_text,
                 "mrkdwn": True,
             }
             if self._thread_ts:
@@ -756,7 +884,7 @@ class SlackStreamConsumer:
                 logger.info(
                     "[SlackStream] Delivered %d chars via fallback postMessage "
                     "after broken stream (channel=%s thread=%s)",
-                    len(text), self._channel_id, self._thread_ts,
+                    len(delivered_text), self._channel_id, self._thread_ts,
                 )
                 self._final_content_delivered = True
             else:
