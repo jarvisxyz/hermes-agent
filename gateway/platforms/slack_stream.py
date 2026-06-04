@@ -166,6 +166,10 @@ class SlackStreamConsumer:
         # Whether we've sent the first appendStream
         self._started: bool = False
 
+        # Set True when an appendStream call fails with
+        # message_not_in_streaming_state — prevents further API spam
+        self._stream_broken: bool = False
+
     # ── Public sync callbacks (called from agent worker thread) ───────
 
     # Friendly display names for tool step titles.  Tools not listed here
@@ -369,7 +373,7 @@ class SlackStreamConsumer:
         marked complete — this way the user sees the actual tool name flash
         briefly before the dedicated tool step card takes over.
         """
-        if self._initial_step_id is None:
+        if self._initial_step_id is None or self._stream_broken:
             return
         step_id = self._initial_step_id
         self._initial_step_id = None  # only complete once
@@ -387,17 +391,28 @@ class SlackStreamConsumer:
         "Gathering information…" placeholder is replaced as fast as possible.
         This step is completed once the first real tool step or text delta
         arrives.
+
+        Raises on failure so the ``run()`` loop falls back to non-streaming.
         """
         resp = await self._client.chat_startStream(
             channel=self._channel_id,
             thread_ts=self._thread_ts,
             task_display_mode="plan",
         )
+        # Validate the response — Slack returns HTTP 200 even on errors
+        # with {ok: false, error: "..."}
+        ok = resp.get("ok", True) if isinstance(resp, dict) else getattr(resp, "data", {}).get("ok", True)
+        if ok is False:
+            error = resp.get("error", "unknown_error") if isinstance(resp, dict) else "unknown_error"
+            raise RuntimeError(f"chat.startStream failed: {error}")
+
         self._stream_ts = resp.get("ts") or resp.get("message", {}).get("ts")
         if not self._stream_ts:
             # Some SDK versions nest differently
             data = resp.data if hasattr(resp, "data") else resp
             self._stream_ts = data.get("ts") or data.get("message", {}).get("ts")
+        if not self._stream_ts:
+            raise RuntimeError("chat.startStream returned no message ts")
         logger.debug(
             "[SlackStream] Started stream: channel=%s thread=%s stream_ts=%s",
             self._channel_id, self._thread_ts, self._stream_ts,
@@ -410,17 +425,26 @@ class SlackStreamConsumer:
         # the agent starts producing output.
         self._task_counter += 1
         self._initial_step_id = f"init_{self._task_counter}"
-        await self._send_task_step(
-            self._initial_step_id,
-            "Processing",
-            "in_progress",
-            "",
-        )
+        try:
+            await self._send_task_step(
+                self._initial_step_id,
+                "Processing",
+                "in_progress",
+                "",
+            )
+        except Exception as e:
+            # If the very first appendStream fails, the stream is unusable —
+            # raise so run() can bail out early instead of spamming failures.
+            raise RuntimeError(f"Initial appendStream failed after startStream: {e}") from e
         self._active_tasks[self._initial_step_id] = "Processing"
 
     async def _ensure_response_step(self) -> str:
         """Create the Response step if it doesn't exist yet, return its ID."""
         if self._response_step_id is not None:
+            return self._response_step_id
+        if self._stream_broken:
+            # Return a dummy ID — we can't actually create the step
+            self._response_step_id = f"response_broken"
             return self._response_step_id
         self._task_counter += 1
         self._response_step_id = f"response_{self._task_counter}"
@@ -444,7 +468,7 @@ class SlackStreamConsumer:
         updates (same as ``details``), so we must send only the delta — the
         new text since the last flush — not the full buffer.
         """
-        if not self._text_buffer or not self._stream_ts:
+        if not self._text_buffer or not self._stream_ts or self._stream_broken:
             return
         # Only send text we haven't already flushed
         new_text = self._text_buffer[self._total_text_sent:]
@@ -469,11 +493,9 @@ class SlackStreamConsumer:
         except Exception as e:
             logger.warning("[SlackStream] flush text to Response step failed: %s", e)
 
-    async def _send_task_step(
-        self, task_id: str, name: str, status: str, description: str,
-    ) -> None:
+    async def _send_task_step(self, task_id: str, name: str, status: str, description: str) -> None:
         """Send a TaskUpdateChunk for a tool/thinking step."""
-        if not self._stream_ts:
+        if not self._stream_ts or self._stream_broken:
             return
         try:
             chunk = self._make_task_chunk(task_id, name, status, details=description or None)
@@ -483,7 +505,11 @@ class SlackStreamConsumer:
                 chunks=[chunk],
             )
         except Exception as e:
-            logger.warning("[SlackStream] task step failed for %s: %s", name, e)
+            if "message_not_in_streaming_state" in str(e):
+                self._stream_broken = True
+                logger.debug("[SlackStream] Stream closed — suppressing further appendStream calls")
+            else:
+                logger.warning("[SlackStream] task step failed for %s: %s", name, e)
 
     def _make_task_chunk(
         self,
@@ -521,12 +547,29 @@ class SlackStreamConsumer:
             return chunk
 
     async def _finalize(self) -> None:
-        """Flush remaining text, complete active tasks, and stop the stream."""
+        """Flush remaining text, complete active tasks, and stop the stream.
+
+        Handles ``message_not_in_streaming_state`` gracefully — if Slack has
+        already closed the stream (server-side timeout), we can't append any
+        more chunks but the content already rendered is intact.
+        """
+        if self._stream_broken:
+            # Stream is already closed server-side — just try stopStream
+            # for cleanup and return.
+            await self._try_stop_stream()
+            return
+
+        _STREAM_CLOSED = "message_not_in_streaming_state"
+
         # Complete any still-active tool/thinking tasks
         for task_id, name in list(self._active_tasks.items()):
             try:
                 await self._send_task_step(task_id, name, "complete", "")
-            except Exception:
+            except Exception as e:
+                err_str = str(e)
+                if _STREAM_CLOSED in err_str:
+                    logger.debug("[SlackStream] Stream already closed, skipping task completion for %s", name)
+                    break  # No point trying more tasks
                 pass
 
         # Flush remaining text and mark the Response step as complete
@@ -548,20 +591,36 @@ class SlackStreamConsumer:
                 )
                 self._text_buffer = ""
             except Exception as e:
-                logger.warning("[SlackStream] finalize Response step failed: %s", e)
+                err_str = str(e)
+                if _STREAM_CLOSED in err_str:
+                    logger.debug(
+                        "[SlackStream] Stream already closed before final text flush — "
+                        "content already rendered."
+                    )
+                else:
+                    logger.warning("[SlackStream] finalize Response step failed: %s", e)
 
         # Stop the stream
-        if self._stream_ts:
-            try:
-                await self._client.chat_stopStream(
-                    channel=self._channel_id,
-                    ts=self._stream_ts,
-                )
-                logger.debug(
-                    "[SlackStream] Stopped stream: stream_ts=%s",
-                    self._stream_ts,
-                )
-            except Exception as e:
-                logger.warning("[SlackStream] stopStream failed: %s", e)
+        await self._try_stop_stream()
 
         self._started = False
+
+    async def _try_stop_stream(self) -> None:
+        """Best-effort call to chat.stopStream — safe even if stream is already closed."""
+        if not self._stream_ts:
+            return
+        try:
+            await self._client.chat_stopStream(
+                channel=self._channel_id,
+                ts=self._stream_ts,
+            )
+            logger.debug(
+                "[SlackStream] Stopped stream: stream_ts=%s",
+                self._stream_ts,
+            )
+        except Exception as e:
+            err_str = str(e)
+            if "message_not_in_streaming_state" in err_str:
+                logger.debug("[SlackStream] stopStream: stream already closed server-side")
+            else:
+                logger.warning("[SlackStream] stopStream failed: %s", e)
