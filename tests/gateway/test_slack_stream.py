@@ -1,6 +1,7 @@
 """Tests for SlackStreamConsumer — native Steps API streaming."""
 
 import asyncio
+import importlib.util
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -240,6 +241,10 @@ class TestTaskIdTracking:
 
 
 class TestMakeTaskChunk:
+    @pytest.mark.skipif(
+        not importlib.util.find_spec("slack_sdk"),
+        reason="slack_sdk not installed"
+    )
     def test_typed_chunk_with_sdk(self, consumer):
         """When slack_sdk is available, _make_task_chunk returns TaskUpdateChunk."""
         chunk = consumer._make_task_chunk("t1", "Web Search", "in_progress", details="query: test")
@@ -247,6 +252,10 @@ class TestMakeTaskChunk:
         from slack_sdk.models.messages.chunk import TaskUpdateChunk
         assert isinstance(chunk, TaskUpdateChunk)
 
+    @pytest.mark.skipif(
+        not importlib.util.find_spec("slack_sdk"),
+        reason="slack_sdk not installed"
+    )
     def test_chunk_with_output(self, consumer):
         """TaskUpdateChunk with output field for Response step text."""
         chunk = consumer._make_task_chunk("r1", "Response", "complete", output="Hello world")
