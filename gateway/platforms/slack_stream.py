@@ -137,6 +137,14 @@ class SlackStreamConfig:
     # markdown rendering).  "dense" collapses consecutive tool
     # calls into a single summarized card.
     task_display_mode: str = "timeline"
+    # ── Plan-mode text delivery ────────────────────────────────
+    # When True and task_display_mode is "plan", response text is
+    # NOT sent through TaskUpdateChunk.output (which has a 256-char
+    # limit and no markdown rendering).  Instead, the stream
+    # delivers only step cards (grouped under a single collapsible
+    # tree), and the response text is delivered via chat.postMessage
+    # after the stream completes — giving full mrkdwn rendering.
+    plan_text_via_postmessage: bool = True
     # ── Keep-alive settings ──────────────────────────────────────
     # How long (seconds) with no queue activity before sending a
     # keep-alive ping.  Slack closes idle streams after ~5 min;
@@ -236,6 +244,10 @@ class SlackStreamConsumer:
         # fallback postMessage).  The gateway checks this to avoid duplicate
         # sends.
         self._final_content_delivered: bool = False
+
+        # Whether chat.stopStream succeeded (used to decide if fallback
+        # postMessage is needed for plan-mode text delivery).
+        self._stop_stream_succeeded: bool = False
 
         # ── Keep-alive state ─────────────────────────────────────────
         # Timestamp of the last queue activity (delta, task, or done).
@@ -543,6 +555,7 @@ class SlackStreamConsumer:
             self._channel_id, self._thread_ts, self._stream_ts,
         )
         self._started = True
+        self._stop_stream_succeeded = False
 
         # Emit an initial step immediately to replace Slack's "Gathering
         # information…" placeholder.  This step will be completed (and
@@ -601,6 +614,16 @@ class SlackStreamConsumer:
         """Whether the stream was started in plan display mode."""
         return self._config.task_display_mode == "plan"
 
+    def _skip_in_stream_text(self) -> bool:
+        """Whether response text should be delivered via postMessage instead of in-stream.
+
+        When ``plan_text_via_postmessage`` is True and the display mode is ``plan``,
+        text is not sent through TaskUpdateChunk.output (256-char limit, no markdown).
+        Instead, it's delivered via chat.postMessage after the stream completes,
+        giving full mrkdwn rendering while keeping the grouped step cards.
+        """
+        return self._is_plan_mode() and self._config.plan_text_via_postmessage
+
     async def _flush_text(self) -> None:
         """Flush accumulated text deltas to the stream.
 
@@ -608,16 +631,26 @@ class SlackStreamConsumer:
         ``markdown_text`` chunks which render proper Slack mrkdwn with
         a 12 000-char limit per call.
 
-        **Plan mode**: ``markdown_text`` is not allowed — text must go
-        through ``TaskUpdateChunk.output`` (256-char limit, no markdown
-        rendering).  We maintain a "Response" step and update it with
-        the delta each flush.
+        **Plan mode with plan_text_via_postmessage** (default): Text
+        is NOT sent through the stream at all — it's accumulated
+        in ``_text_buffer`` and delivered via ``chat.postMessage``
+        after the stream completes, giving full mrkdwn rendering
+        while keeping the grouped step-card layout.
+
+        **Plan mode (legacy)**: ``markdown_text`` is not allowed —
+        text must go through ``TaskUpdateChunk.output`` (256-char
+        limit, no markdown rendering).  We maintain a "Response"
+        step and update it with the delta each flush.
 
         Slack's ``chat.appendStream`` **appends** content across calls,
         so we must send only the delta — the new text since the last
         flush — not the full buffer.
         """
         if not self._text_buffer or not self._stream_ts or self._stream_broken:
+            return
+        # When plan_text_via_postmessage is active, skip in-stream text
+        # delivery — text will be sent via postMessage after finalization.
+        if self._skip_in_stream_text():
             return
         # Only send text we haven't already flushed
         new_text = self._text_buffer[self._total_text_sent:]
@@ -818,7 +851,12 @@ class SlackStreamConsumer:
                 pass
 
         # Flush remaining text
-        if self._text_buffer:
+        if self._skip_in_stream_text():
+            # Plan mode with plan_text_via_postmessage: don't send text
+            # through the stream at all — deliver via postMessage after
+            # stopping the stream for full mrkdwn rendering.
+            pass
+        elif self._text_buffer:
             try:
                 new_text = self._text_buffer[self._total_text_sent:]
                 if new_text:
@@ -884,27 +922,42 @@ class SlackStreamConsumer:
                 else:
                     logger.warning("[SlackStream] complete Response step failed: %s", e)
 
-        # Stop the stream
-        await self._try_stop_stream()
+        # Stop the stream — include the response text in the stopStream
+        # call so the stream card contains both the grouped step cards
+        # AND the response text.  This keeps the steps visible after
+        # completion rather than disappearing when a separate postMessage
+        # lands below the stream card.
+        _plan_text = ""
+        if self._skip_in_stream_text() and self._text_buffer:
+            # Plan mode with plan_text_via_postmessage: deliver text
+            # inside the stopStream call for persistent step display.
+            _plan_text = self._text_buffer
+
+        await self._try_stop_stream(final_text=_plan_text)
+
+        # If stopStream rejected markdown_text (plan mode isolation) and
+        # we still have text to deliver, fall back to postMessage.
+        if _plan_text and not self._final_content_delivered:
+            await self._fallback_post_message(intentional=True)
 
         self._started = False
-        self._final_content_delivered = True
+        if not self._final_content_delivered:
+            self._final_content_delivered = True
 
-    async def _fallback_post_message(self) -> None:
-        """Fall back when the stream is broken.
+    async def _fallback_post_message(self, *, intentional: bool = False) -> None:
+        """Deliver accumulated text via chat.postMessage.
 
+        When *intentional* is False (default): the stream broke mid-delivery.
         Attempts to **replace** the broken stream message (which shows
         "Something went wrong") by calling ``chat.update`` on the stream's
         own ``ts`` with properly formatted mrkdwn text.  If that succeeds,
         the error card is replaced with the actual response content and
         the user never sees the "Something went wrong" banner.
 
-        If ``chat.update`` fails (e.g. Slack restricts editing of
-        assistant thread messages), falls back to ``chat.postMessage``
-        as a new thread reply instead.  In that case, a brief explanatory
-        prefix (``fallback_explanation``) is prepended so the user
-        understands that the "Something went wrong" banner is a display
-        issue — not an actual failure.
+        When *intentional* is True: this is a planned delivery (e.g.
+        plan_text_via_postmessage mode).  Skip chat.update (don't
+        overwrite the step cards) and don't prepend the fallback
+        explanation.  Just post the text as a new thread message.
 
         The text is converted from standard markdown to Slack mrkdwn via
         the ``format_message`` callable (passed from ``SlackAdapter`` at
@@ -923,35 +976,36 @@ class SlackStreamConsumer:
             except Exception as e:
                 logger.debug("[SlackStream] format_message failed in fallback: %s", e)
 
-        # Strategy 1: Update the broken stream message in-place to replace
-        # the "Something went wrong" card with properly formatted content.
-        if self._stream_ts:
-            try:
-                update_kwargs = {
-                    "channel": self._channel_id,
-                    "ts": self._stream_ts,
-                    "text": text,
-                }
-                result = await self._client.chat_update(**update_kwargs)
-                ok = result.get("ok", True) if isinstance(result, dict) else getattr(result, "data", {}).get("ok", True)
-                if ok is not False:
-                    logger.info(
-                        "[SlackStream] Replaced broken stream message via chat.update "
-                        "(channel=%s stream_ts=%s, %d chars)",
-                        self._channel_id, self._stream_ts, len(text),
-                    )
-                    self._final_content_delivered = True
-                    return
-                else:
-                    error = result.get("error", "unknown") if isinstance(result, dict) else "unknown"
-                    logger.debug("[SlackStream] chat.update on stream msg failed: %s — falling back to postMessage", error)
-            except Exception as e:
-                logger.debug("[SlackStream] chat.update on stream msg raised: %s — falling back to postMessage", e)
+        if not intentional:
+            # Strategy 1: Update the broken stream message in-place to replace
+            # the "Something went wrong" card with properly formatted content.
+            if self._stream_ts:
+                try:
+                    update_kwargs = {
+                        "channel": self._channel_id,
+                        "ts": self._stream_ts,
+                        "text": text,
+                    }
+                    result = await self._client.chat_update(**update_kwargs)
+                    ok = result.get("ok", True) if isinstance(result, dict) else getattr(result, "data", {}).get("ok", True)
+                    if ok is not False:
+                        logger.info(
+                            "[SlackStream] Replaced broken stream message via chat.update "
+                            "(channel=%s stream_ts=%s, %d chars)",
+                            self._channel_id, self._stream_ts, len(text),
+                        )
+                        self._final_content_delivered = True
+                        return
+                    else:
+                        error = result.get("error", "unknown") if isinstance(result, dict) else "unknown"
+                        logger.debug("[SlackStream] chat.update on stream msg failed: %s — falling back to postMessage", error)
+                except Exception as e:
+                    logger.debug("[SlackStream] chat.update on stream msg raised: %s — falling back to postMessage", e)
 
         # Strategy 2: Post a new message in the thread.
-        # Prepend the explanatory prefix (if configured) so users understand
-        # the "Something went wrong" banner is just a display glitch.
-        explanation = self._config.fallback_explanation or ""
+        # When intentional, skip the "disconnected" explanation prefix.
+        # When broken-stream, prepend it so users understand the banner.
+        explanation = "" if intentional else (self._config.fallback_explanation or "")
         if explanation and self._format_message:
             # Format the explanation too (it may contain mrkdwn like _italic_)
             try:
@@ -985,21 +1039,85 @@ class SlackStreamConsumer:
                 "[SlackStream] Fallback postMessage failed: %s", e, exc_info=True,
             )
 
-    async def _try_stop_stream(self) -> None:
-        """Best-effort call to chat.stopStream — safe even if stream is already closed."""
+    async def _try_stop_stream(
+        self,
+        *,
+        final_text: str = "",
+        chunks: Optional[list] = None,
+    ) -> None:
+        """Best-effort call to chat.stopStream — safe even if stream is already closed.
+
+        When *final_text* is provided and the stream is in plan mode, the text
+        is included as ``markdown_text`` in the ``stopStream`` call so the
+        finalised stream card contains both the grouped step cards AND the
+        response text — preventing the steps from disappearing after completion.
+        If Slack rejects ``markdown_text`` in plan mode (``streaming_mode_mismatch``),
+        falls back to ``blocks`` chunks, then to a separate ``postMessage``.
+        """
         if not self._stream_ts:
             return
+
+        kwargs: Dict[str, Any] = {
+            "channel": self._channel_id,
+            "ts": self._stream_ts,
+        }
+
+        # Include final text in the stopStream call when provided.
+        # This keeps step cards visible inside the stream card rather
+        # than delivering text via a separate postMessage that may
+        # cause Slack to collapse/hide the completed step cards.
+        if final_text:
+            # Format markdown → Slack mrkdwn
+            formatted_text = final_text
+            if self._format_message:
+                try:
+                    formatted_text = self._format_message(final_text)
+                except Exception:
+                    pass
+            kwargs["markdown_text"] = formatted_text
+
+        if chunks:
+            kwargs["chunks"] = chunks
+
         try:
-            await self._client.chat_stopStream(
-                channel=self._channel_id,
-                ts=self._stream_ts,
-            )
+            await self._client.chat_stopStream(**kwargs)
             logger.debug(
-                "[SlackStream] Stopped stream: stream_ts=%s",
+                "[SlackStream] Stopped stream with %d chars final text: stream_ts=%s",
+                len(final_text) if final_text else 0,
                 self._stream_ts,
             )
+            # Track that final content was delivered inside the stream
+            if final_text:
+                self._final_content_delivered = True
+            self._stop_stream_succeeded = True
         except Exception as e:
             if _is_stream_closed_error(e):
                 logger.debug("[SlackStream] stopStream: stream already closed server-side")
             else:
-                logger.warning("[SlackStream] stopStream failed: %s", e)
+                # If markdown_text was rejected due to mode isolation in plan mode,
+                # try again without it — we'll deliver text via postMessage instead.
+                err_data = getattr(e, "response", None)
+                err_code = ""
+                if err_data is not None:
+                    data = getattr(err_data, "data", None) or {}
+                    err_code = data.get("error", "")
+                if "streaming_mode_mismatch" in (str(e) + err_code):
+                    logger.debug(
+                        "[SlackStream] stopStream rejected markdown_text in plan mode — "
+                        "retrying without text for postMessage delivery"
+                    )
+                    # Retry stopStream without markdown_text
+                    retry_kwargs = {
+                        "channel": self._channel_id,
+                        "ts": self._stream_ts,
+                    }
+                    try:
+                        await self._client.chat_stopStream(**retry_kwargs)
+                        self._stop_stream_succeeded = True
+                    except Exception as retry_e:
+                        if _is_stream_closed_error(retry_e):
+                            logger.debug("[SlackStream] stopStream retry: stream already closed")
+                        else:
+                            logger.warning("[SlackStream] stopStream retry failed: %s", retry_e)
+                else:
+                    logger.warning("[SlackStream] stopStream failed: %s", e)

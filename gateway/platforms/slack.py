@@ -1333,6 +1333,8 @@ class SlackAdapter(BasePlatformAdapter):
             show_thinking=self.config.extra.get("show_thinking_steps", True),
             set_title=self.config.extra.get("set_thread_title", True),
             feedback_buttons=self.config.extra.get("feedback_buttons", True),
+            task_display_mode=self.config.extra.get("task_display_mode", "timeline"),
+            plan_text_via_postmessage=self.config.extra.get("plan_text_via_postmessage", True),
         )
         return SlackStreamConsumer(
             client=client,
