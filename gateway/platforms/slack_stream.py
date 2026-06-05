@@ -1,37 +1,44 @@
 """Slack AI Assistant streaming consumer — native step indicators via the Steps API.
 
 Uses Slack's ``chat.startStream`` / ``chat.appendStream`` / ``chat.stopStream``
-methods with ``TaskUpdateChunk`` objects to render native collapsible step cards
-with checkmarks, chevrons, and status indicators — the same UI pattern used
-by Slack's own AI assistants (e.g. Slack AI, Highbeam's Luma).
+methods with ``TaskUpdateChunk`` and ``MarkdownTextChunk`` objects to render
+native collapsible step cards with checkmarks, chevrons, and status indicators
+— the same UI pattern used by Slack's own AI assistants (e.g. Slack AI,
+Highbeam's Luma).
 
 Architecture
 ------------
 Instead of the legacy postMessage → chat.update edit loop, this consumer:
 
-1. Calls ``chat.startStream`` with ``task_display_mode="plan"`` to create a
-   streaming message container in **plan mode**.  The response includes a
-   ``ts`` for the stream.
+1. Calls ``chat.startStream`` with a configurable ``task_display_mode``
+   (default: ``"timeline"``) to create a streaming message container.
+   The response includes a ``ts`` for the stream.
 
 2. Calls ``chat.appendStream`` with ``TaskUpdateChunk`` objects for each step:
    - When a tool starts:  ``TaskUpdateChunk(id, title, status="in_progress")``
    - When a tool completes: ``TaskUpdateChunk(id, title, status="complete", details=...)``
    - When a tool fails:  ``TaskUpdateChunk(id, title, status="failed", details=...)``
 
-3. For the model's text output, emits a **"Response" task step** whose
-   ``output`` field carries the markdown text.  This is required because
-   plan mode streams cannot use ``markdown_text`` — they only accept
-   ``chunks``.  The text is buffered and flushed periodically as incremental
-   updates to the Response step's ``output``.
+3. For the model's text output:
+
+   - **Timeline / dense mode** (default): Text is delivered via
+     ``MarkdownTextChunk`` objects which render proper Slack mrkdwn
+     (bold, italic, links, headers, code blocks, etc.) with a
+     12 000-char limit per call.
+
+   - **Plan mode** (legacy): ``markdown_text`` is not allowed — text
+     must go through ``TaskUpdateChunk.output`` (256-char limit, no
+     markdown rendering).  A "Response" step is maintained and updated
+     with incremental text deltas.
 
 4. Calls ``chat.stopStream`` to finalize.
 
 .. important::
    Slack's streaming API enforces **mode isolation**: a stream started with
-   ``task_display_mode="plan"`` can only accept ``chunks`` (not
-   ``markdown_text``), and vice versa.  Attempting to mix them raises
-   ``streaming_mode_mismatch``.  This consumer uses plan mode exclusively
-   and routes all text through ``TaskUpdateChunk.output``.
+   ``task_display_mode="plan"`` can only accept ``task_update`` chunks
+   (not ``markdown_text``), and vice versa.  Attempting to mix them raises
+   ``streaming_mode_mismatch``.  This consumer defaults to ``"timeline"``
+   mode which supports both chunk types and renders proper markdown.
 
 Thread Safety
 -------------
@@ -121,6 +128,15 @@ class SlackStreamConfig:
     feedback_buttons: bool = True
     # Title for the Response step that carries the LLM text output
     response_step_title: str = "Response"
+    # ── Stream display mode ─────────────────────────────────────
+    # "timeline" (default): each step is a separate card; response
+    # text is delivered via ``markdown_text`` chunks which render
+    # proper Slack mrkdwn.  "plan" groups all task cards together
+    # but does NOT support ``markdown_text`` — response text must
+    # go through ``task_update.output`` (256-char limit, no
+    # markdown rendering).  "dense" collapses consecutive tool
+    # calls into a single summarized card.
+    task_display_mode: str = "timeline"
     # ── Keep-alive settings ──────────────────────────────────────
     # How long (seconds) with no queue activity before sending a
     # keep-alive ping.  Slack closes idle streams after ~5 min;
@@ -489,7 +505,12 @@ class SlackStreamConsumer:
             logger.debug("[SlackStream] complete_initial_step failed: %s", e)
 
     async def _start_stream(self) -> None:
-        """Initiate a streaming message via chat.startStream in plan mode.
+        """Initiate a streaming message via chat.startStream.
+
+        The ``task_display_mode`` is configurable (default: ``"timeline"``).
+        In timeline mode, the response text is delivered via
+        ``markdown_text`` chunks which render proper Slack mrkdwn.
+        In plan mode, text must go through ``task_update.output`` instead.
 
         Immediately emits an initial "Processing…" step so Slack's built-in
         "Gathering information…" placeholder is replaced as fast as possible.
@@ -501,7 +522,7 @@ class SlackStreamConsumer:
         resp = await self._client.chat_startStream(
             channel=self._channel_id,
             thread_ts=self._thread_ts,
-            task_display_mode="plan",
+            task_display_mode=self._config.task_display_mode,
         )
         # Validate the response — Slack returns HTTP 200 even on errors
         # with {ok: false, error: "..."}
@@ -561,16 +582,40 @@ class SlackStreamConsumer:
         )
         return self._response_step_id
 
+    def _make_markdown_text_chunk(self, text: str) -> Any:
+        """Build a markdown_text chunk for Slack's streaming API.
+
+        ``markdown_text`` chunks render proper Slack mrkdwn (bold, italic,
+        links, headers, code blocks, etc.) in the streamed message.  They
+        are only valid in ``timeline`` and ``dense`` display modes — NOT
+        in ``plan`` mode (which raises ``streaming_mode_mismatch``).
+        """
+        try:
+            from slack_sdk.models.messages.chunk import MarkdownTextChunk
+            return MarkdownTextChunk(text=text)
+        except ImportError:
+            # Fallback for slack_sdk < 3.35
+            return {"type": "markdown_text", "text": text}
+
+    def _is_plan_mode(self) -> bool:
+        """Whether the stream was started in plan display mode."""
+        return self._config.task_display_mode == "plan"
+
     async def _flush_text(self) -> None:
-        """Flush accumulated text deltas to the Response step's output field.
+        """Flush accumulated text deltas to the stream.
 
-        In plan mode, ``markdown_text`` is not allowed — text must be carried
-        inside a ``TaskUpdateChunk.output`` field.  We maintain a "Response"
-        step and update it with the new text each flush.
+        **Timeline / dense mode** (default): Text is delivered via
+        ``markdown_text`` chunks which render proper Slack mrkdwn with
+        a 12 000-char limit per call.
 
-        Slack's ``chat.appendStream`` **appends** the ``output`` field across
-        updates (same as ``details``), so we must send only the delta — the
-        new text since the last flush — not the full buffer.
+        **Plan mode**: ``markdown_text`` is not allowed — text must go
+        through ``TaskUpdateChunk.output`` (256-char limit, no markdown
+        rendering).  We maintain a "Response" step and update it with
+        the delta each flush.
+
+        Slack's ``chat.appendStream`` **appends** content across calls,
+        so we must send only the delta — the new text since the last
+        flush — not the full buffer.
         """
         if not self._text_buffer or not self._stream_ts or self._stream_broken:
             return
@@ -579,18 +624,28 @@ class SlackStreamConsumer:
         if not new_text:
             return
         try:
-            step_id = await self._ensure_response_step()
-            chunk = self._make_task_chunk(
-                step_id,
-                self._config.response_step_title,
-                "in_progress",
-                output=new_text,
-            )
-            await self._client.chat_appendStream(
-                channel=self._channel_id,
-                ts=self._stream_ts,
-                chunks=[chunk],
-            )
+            if self._is_plan_mode():
+                # Plan mode: text goes through task_update.output
+                step_id = await self._ensure_response_step()
+                chunk = self._make_task_chunk(
+                    step_id,
+                    self._config.response_step_title,
+                    "in_progress",
+                    output=new_text,
+                )
+                await self._client.chat_appendStream(
+                    channel=self._channel_id,
+                    ts=self._stream_ts,
+                    chunks=[chunk],
+                )
+            else:
+                # Timeline / dense mode: text goes through markdown_text
+                chunk = self._make_markdown_text_chunk(new_text)
+                await self._client.chat_appendStream(
+                    channel=self._channel_id,
+                    ts=self._stream_ts,
+                    chunks=[chunk],
+                )
             self._total_text_sent = len(self._text_buffer)
             # Don't clear the buffer — we need the full text to compute
             # the delta for the next flush.
@@ -599,7 +654,7 @@ class SlackStreamConsumer:
                 self._stream_broken = True
                 logger.debug("[SlackStream] Stream closed during text flush — suppressing further calls")
             else:
-                logger.warning("[SlackStream] flush text to Response step failed: %s", e)
+                logger.warning("[SlackStream] flush text failed: %s", e)
 
     async def _send_task_step(self, task_id: str, name: str, status: str, description: str) -> None:
         """Send a TaskUpdateChunk for a tool/thinking step."""
@@ -762,23 +817,40 @@ class SlackStreamConsumer:
                     return
                 pass
 
-        # Flush remaining text and mark the Response step as complete
-        if self._text_buffer or self._response_step_id:
+        # Flush remaining text
+        if self._text_buffer:
             try:
-                step_id = await self._ensure_response_step()
-                # Only send text not yet flushed (Slack appends output)
-                new_text = (self._text_buffer or "")[self._total_text_sent:]
-                chunk = self._make_task_chunk(
-                    step_id,
-                    self._config.response_step_title,
-                    "complete",
-                    output=new_text or None,
-                )
-                await self._client.chat_appendStream(
-                    channel=self._channel_id,
-                    ts=self._stream_ts,
-                    chunks=[chunk],
-                )
+                new_text = self._text_buffer[self._total_text_sent:]
+                if new_text:
+                    if self._is_plan_mode():
+                        # Plan mode: complete the Response step with remaining text
+                        step_id = await self._ensure_response_step()
+                        chunk = self._make_task_chunk(
+                            step_id,
+                            self._config.response_step_title,
+                            "complete",
+                            output=new_text,
+                        )
+                    else:
+                        # Timeline / dense mode: final markdown_text chunk
+                        chunk = self._make_markdown_text_chunk(new_text)
+                    await self._client.chat_appendStream(
+                        channel=self._channel_id,
+                        ts=self._stream_ts,
+                        chunks=[chunk],
+                    )
+                # In plan mode, also complete the Response step (even if no new text)
+                if self._is_plan_mode() and self._response_step_id:
+                    chunk = self._make_task_chunk(
+                        self._response_step_id,
+                        self._config.response_step_title,
+                        "complete",
+                    )
+                    await self._client.chat_appendStream(
+                        channel=self._channel_id,
+                        ts=self._stream_ts,
+                        chunks=[chunk],
+                    )
                 self._text_buffer = ""
             except Exception as e:
                 if _is_stream_closed_error(e):
@@ -792,7 +864,25 @@ class SlackStreamConsumer:
                     await self._fallback_post_message()
                     return
                 else:
-                    logger.warning("[SlackStream] finalize Response step failed: %s", e)
+                    logger.warning("[SlackStream] finalize text flush failed: %s", e)
+        elif self._is_plan_mode() and self._response_step_id:
+            # Plan mode with no text buffer but an active Response step — complete it
+            try:
+                chunk = self._make_task_chunk(
+                    self._response_step_id,
+                    self._config.response_step_title,
+                    "complete",
+                )
+                await self._client.chat_appendStream(
+                    channel=self._channel_id,
+                    ts=self._stream_ts,
+                    chunks=[chunk],
+                )
+            except Exception as e:
+                if _is_stream_closed_error(e):
+                    self._stream_broken = True
+                else:
+                    logger.warning("[SlackStream] complete Response step failed: %s", e)
 
         # Stop the stream
         await self._try_stop_stream()
