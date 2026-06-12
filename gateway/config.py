@@ -975,6 +975,10 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_user_allowed_commands"] = platform_cfg["group_user_allowed_commands"]
                 if plat in {Platform.DISCORD, Platform.SLACK} and "channel_skill_bindings" in platform_cfg:
                     bridged["channel_skill_bindings"] = platform_cfg["channel_skill_bindings"]
+                if plat == Platform.SLACK and "task_display_mode" in platform_cfg:
+                    bridged["task_display_mode"] = platform_cfg["task_display_mode"]
+                if plat == Platform.SLACK and "plan_text_via_postmessage" in platform_cfg:
+                    bridged["plan_text_via_postmessage"] = platform_cfg["plan_text_via_postmessage"]
                 if "channel_prompts" in platform_cfg:
                     channel_prompts = platform_cfg["channel_prompts"]
                     if isinstance(channel_prompts, dict):
